@@ -1,0 +1,52 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(push_constant) uniform parameter {
+    uint head_dim;
+    uint heads;
+    uint tokens;
+    uint prefix_tokens;
+    uint pairs;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float input_data[]; };
+layout(binding = 1) readonly buffer C { C_TYPE cosine_data[]; };
+layout(binding = 2) readonly buffer S { C_TYPE sine_data[]; };
+layout(binding = 3) writeonly buffer D { D_TYPE output_data[]; };
+
+void main() {
+    const uint span_x = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    const uint span_y = gl_NumWorkGroups.y * gl_WorkGroupSize.y;
+    const uint pair_idx = gl_GlobalInvocationID.x + span_x *
+        (gl_GlobalInvocationID.y + span_y * gl_GlobalInvocationID.z);
+    if (pair_idx >= p.pairs) return;
+
+    const uint half_dim = p.head_dim / 2;
+    uint q = pair_idx;
+    const uint dim = q % half_dim; q /= half_dim;
+    const uint head = q % p.heads; q /= p.heads;
+    const uint token = q % p.tokens;
+    const uint batch = q / p.tokens;
+    const uint base = dim + p.head_dim * (head + p.heads * (token + p.tokens * batch));
+    const uint other = base + half_dim;
+
+    const float first = input_data[base];
+    const float second = input_data[other];
+    if (token < p.prefix_tokens) {
+        output_data[base] = D_TYPE(first);
+        output_data[other] = D_TYPE(second);
+        return;
+    }
+
+    const uint angle = dim + p.head_dim * (token - p.prefix_tokens);
+    const float cosine_first = float(cosine_data[angle]);
+    const float sine_first = float(sine_data[angle]);
+    const float cosine_second = float(cosine_data[angle + half_dim]);
+    const float sine_second = float(sine_data[angle + half_dim]);
+    output_data[base] = D_TYPE(first * cosine_first - second * sine_first);
+    output_data[other] = D_TYPE(second * cosine_second + first * sine_second);
+}

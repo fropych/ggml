@@ -1,0 +1,29 @@
+#version 450
+
+layout(push_constant) uniform parameter {
+    uint C; uint W; uint H;
+    uint WS; uint NWX;
+    uint elements;
+} p;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer X { float input_data[]; };
+layout(binding = 1) writeonly buffer D { float output_data[]; };
+
+void main() {
+    const uint x_span = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    const uint y_span = gl_NumWorkGroups.y * gl_WorkGroupSize.y;
+    const uint idx = gl_GlobalInvocationID.x + x_span *
+        (gl_GlobalInvocationID.y + y_span * gl_GlobalInvocationID.z);
+    if (idx >= p.elements) return;
+    uint q = idx;
+    const uint c = q % p.C; q /= p.C;
+    const uint x = q % p.W;
+    const uint y = q / p.W;
+    const uint bx = x / p.WS;
+    const uint by = y / p.WS;
+    const uint wx = x % p.WS;
+    const uint wy = y % p.WS;
+    const uint window = by * p.NWX + bx;
+    const uint src = c + p.C * (wx + p.WS * (wy + p.WS * window));
+    output_data[idx] = input_data[src];
+}

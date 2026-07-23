@@ -8,6 +8,10 @@ endif()
 
 find_package(Vulkan COMPONENTS glslc REQUIRED)
 
+option(GGML_VULKAN_DISABLE_COOPMAT2
+       "Disable NV cooperative matrix 2 shaders (useful for controlled CM1 benchmarks)"
+       OFF)
+
 if (DEFINED ENV{VULKAN_SDK})
     list(APPEND CMAKE_PREFIX_PATH "$ENV{VULKAN_SDK}")
 endif()
@@ -73,17 +77,21 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_COOPMAT_GLSLC_SUPPORT"
     )
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix2"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
-        "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
-    )
+    if (GGML_VULKAN_DISABLE_COOPMAT2)
+        message(STATUS "NV cooperative matrix 2 disabled by GGML_VULKAN_DISABLE_COOPMAT2")
+    else()
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2.comp"
+            "GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT"
+        )
 
-    test_shader_extension_support(
-        "GL_NV_cooperative_matrix_decode_vector"
-        "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
-        "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
-    )
+        test_shader_extension_support(
+            "GL_NV_cooperative_matrix_decode_vector"
+            "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat2_decode_vector.comp"
+            "GGML_VULKAN_COOPMAT2_DECODE_VECTOR_GLSLC_SUPPORT"
+        )
+    endif()
 
     test_shader_extension_support(
         "GL_EXT_integer_dot_product"

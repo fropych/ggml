@@ -29,6 +29,10 @@ if (NOT GGML_BACKEND_DL)
     add_subdirectory(magika)
 endif()
 
+if (GGML_VULKAN)
+    add_subdirectory(triposplat)
+endif()
+
 if (GGML_METAL)
     add_subdirectory(perf-metal)
 endif()

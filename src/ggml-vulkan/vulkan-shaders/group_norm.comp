@@ -44,7 +44,6 @@ void main() {
     // Calculate variance
     [[unroll]] for (uint col = start; col < end; col += BLOCK_SIZE) {
         const float xi = float(data_a[col]) - mean;
-        data_d[col] = D_TYPE(xi);
         tmp[tid] += xi * xi;
     }
 
@@ -61,6 +60,8 @@ void main() {
     const float scale = inversesqrt(variance + eps);
 
     [[unroll]] for (uint col = start; col < end; col += BLOCK_SIZE) {
-        data_d[col] *= D_TYPE(scale);
+        // Re-read the source and write the normalized value once.  Keeping the
+        // centered value in dst used an unnecessary write + read round trip.
+        data_d[col] = D_TYPE((float(data_a[col]) - mean) * scale);
     }
 }

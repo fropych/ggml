@@ -797,7 +797,9 @@ void process_shaders() {
     // Norms
     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("group_norm_f16", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}}));
     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("rms_norm_64_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "32"}}));
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_mul_rope_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
@@ -1094,6 +1096,32 @@ void process_shaders() {
         }
     }
 
+    // Persistent-f16 inference path: convolution weights, activations, and
+    // output are all f16. Accumulation remains unchanged (cooperative-matrix
+    // f16 on CM1/CM2, float on the scalar fallback).
+    for (auto unroll : {false, true}) {
+        std::map<std::string, std::string> defines = {
+            {"A_TYPE", "float16_t"}, {"B_TYPE", "float16_t"}, {"D_TYPE", "float16_t"},
+            {"USE_COLLECTIVES", "1"}, {"UNROLL", unroll ? "[[unroll]]" : ""},
+        };
+        string_to_spv("conv2d_f16_f16" + std::string(unroll ? "_unroll" : ""),
+                      "conv2d_mm.comp", defines);
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+        if (unroll) {
+            auto cm2_defines = defines;
+            cm2_defines["COOPMAT2"] = "1";
+            string_to_spv("conv2d_f16_f16", "conv2d_mm.comp", cm2_defines, true, false, true);
+        }
+#endif
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        if (unroll) {
+            auto cm1_defines = defines;
+            cm1_defines["COOPMAT"] = "1";
+            string_to_spv("conv2d_f16_f16", "conv2d_mm.comp", cm1_defines, true, true, false);
+        }
+#endif
+    }
+
     for (auto unroll : {false, true}) {
         for (auto a_f16 : {false, true}) {
             std::map<std::string, std::string> defines = {
@@ -1125,6 +1153,14 @@ void process_shaders() {
     string_to_spv("conv2d_dw_cwhn_f16_f32", "conv2d_dw.comp", merge_maps(base_dict, {{"A_TYPE", "float16_t"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"CWHN", "1"}}));
 
     string_to_spv("roll_f32", "roll.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("dino_rotary_f32", "dino_rotary.comp", {{"C_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("dino_rotary_f32_f16", "dino_rotary.comp", {{"C_TYPE", "float"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("dino_rotary_f16_f32", "dino_rotary.comp", {{"C_TYPE", "float16_t"}, {"D_TYPE", "float"}});
+    string_to_spv("dino_rotary_f16", "dino_rotary.comp", {{"C_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("deform_conv2d_f32", "deform_conv2d.comp", {});
+    string_to_spv("win_part_f32", "win_part.comp", {});
+    string_to_spv("win_unpart_f32", "win_unpart.comp", {});
+    string_to_spv("image_to_patches_f32", "image_to_patches.comp", {});
 
     string_to_spv("add_id_f32", "add_id.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
 

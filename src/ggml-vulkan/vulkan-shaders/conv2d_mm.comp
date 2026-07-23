@@ -471,7 +471,7 @@ void main() {
                 uint32_t OW_idx  = NPQ_idx - N_idx * p.OH * p.OW - OH_idx * p.OW;
                 uint32_t dst_idx = OW_idx + OH_idx * p.nb1 + K_idx * p.nb2 + N_idx * p.nb3;
                 if (aligned != 0 || (K_idx < K && NPQ_idx < NPQ)) {
-                    dst_data[dst_idx] = regC[T_ly][T_lx];
+                    dst_data[dst_idx] = D_TYPE(regC[T_ly][T_lx]);
                 }
             }
         }
