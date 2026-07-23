@@ -68,6 +68,20 @@ static std::string option_value(int & index, int argc, char ** argv) {
     return argv[index];
 }
 
+static std::filesystem::path executable_directory(const char * argv0) {
+    std::error_code error;
+#ifdef __linux__
+    const std::filesystem::path proc_path =
+        std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error && !proc_path.empty()) return proc_path.parent_path();
+    error.clear();
+#endif
+    const std::filesystem::path absolute =
+        std::filesystem::absolute(argv0 ? argv0 : "", error);
+    if (!error) return absolute.parent_path();
+    return std::filesystem::current_path();
+}
+
 static int run_cli_command(int argc, char ** argv) {
     const std::string command = argv[1];
     if (command == "download") {
@@ -110,6 +124,9 @@ static int run_cli_command(int argc, char ** argv) {
         else throw std::invalid_argument("unknown generate option: " + option);
     }
     if (options.models.directory.empty()) throw std::invalid_argument("--model-dir is required");
+    if (options.asset_directory.empty()) {
+        options.asset_directory = (executable_directory(argv[0]) / "assets").string();
+    }
     pipeline runtime(device);
     std::printf("Vulkan device: %s\n", runtime.device_description().c_str());
     const generate_result result = runtime.generate(options);

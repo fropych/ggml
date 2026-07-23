@@ -42,6 +42,49 @@ GGML_VK_VISIBLE_DEVICES=0 \
 them. I64 lookup tables are converted to I32 because that is the Vulkan-native
 index representation used by this port.
 
+## Portable Linux x86-64 bundle
+
+Build a relocatable archive after configuring the Vulkan build:
+
+```sh
+cmake --build builds/vulkan-cm2 --target triposplat-package -j
+```
+
+The result is:
+
+```text
+builds/vulkan-cm2/triposplat-linux-x86_64.tar.gz
+```
+
+Its layout is:
+
+```text
+triposplat-linux-x86_64/
+├── triposplat-vulkan
+├── libggml-vulkan.so.0
+├── libggml-base.so.0
+├── assets/flow_positions.safetensors
+├── README.md
+└── LICENSE
+```
+
+The executable has `RUNPATH=$ORIGIN`, so it finds the bundled ggml libraries
+next to itself without `LD_LIBRARY_PATH`. WebP and SharpYUV are linked
+statically. The target machine still supplies the normal Linux runtime,
+`libgomp.so.1`, `libvulkan.so.1`, and an NVIDIA Vulkan driver. The package is
+intended for another x86-64 machine running the same Linux distribution (or a
+distribution with a compatible glibc/libstdc++).
+
+```sh
+tar -xzf triposplat-linux-x86_64.tar.gz
+cd triposplat-linux-x86_64
+./triposplat-vulkan generate input.webp \
+  --model-dir ./ckpts --output output
+```
+
+The CLI resolves `assets/` relative to its own executable path, so it may be
+started from any working directory.
+
 ## Native C++ end-to-end CLI
 
 `triposplat-vulkan generate` runs image decoding/preprocessing, DINO, stochastic
