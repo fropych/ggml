@@ -5,12 +5,20 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
+#ifndef _WIN32
 #include <fcntl.h>
+#endif
 #include <limits>
 #include <stdexcept>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace triposplat {
 namespace {
@@ -22,6 +30,24 @@ uint64_t read_u64_le(const uint8_t * p) {
     }
     return value;
 }
+
+#ifdef _WIN32
+std::string windows_error_message(DWORD code) {
+    char * message = nullptr;
+    const DWORD size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+            FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, code, 0, reinterpret_cast<char *>(&message), 0, nullptr);
+    std::string result = size && message ? std::string(message, size) :
+        "Windows error " + std::to_string(code);
+    if (message) LocalFree(message);
+    while (!result.empty() &&
+           (result.back() == '\r' || result.back() == '\n' || result.back() == ' ')) {
+        result.pop_back();
+    }
+    return result;
+}
+#endif
 
 ggml_type native_type(const std::string & dtype) {
     if (dtype == "F16")  return GGML_TYPE_F16;
@@ -76,42 +102,114 @@ std::vector<int32_t> convert_to_i32(const safetensors_file & file,
 } // namespace
 
 safetensors_file::safetensors_file(const std::string & path) : path_(path) {
+#ifdef _WIN32
+    const std::wstring wide_path = std::filesystem::u8path(path).wstring();
+    HANDLE file = CreateFileW(wide_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("open " + path + ": " +
+                                 windows_error_message(GetLastError()));
+    }
+    file_handle_ = file;
+    LARGE_INTEGER file_size {};
+    if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart < 0 ||
+        uint64_t(file_size.QuadPart) > std::numeric_limits<size_t>::max()) {
+        const DWORD error = GetLastError();
+        release_mapping();
+        throw std::runtime_error("get size " + path + ": " +
+                                 windows_error_message(error));
+    }
+    size_ = size_t(file_size.QuadPart);
+    if (size_ < 8) {
+        release_mapping();
+        throw std::runtime_error(path + ": truncated safetensors file");
+    }
+    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    if (!mapping) {
+        const DWORD error = GetLastError();
+        release_mapping();
+        throw std::runtime_error("map " + path + ": " +
+                                 windows_error_message(error));
+    }
+    mapping_handle_ = mapping;
+    mapping_ = static_cast<const uint8_t *>(
+        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0));
+    if (!mapping_) {
+        const DWORD error = GetLastError();
+        release_mapping();
+        throw std::runtime_error("map view " + path + ": " +
+                                 windows_error_message(error));
+    }
+#else
     fd_ = ::open(path.c_str(), O_RDONLY);
     if (fd_ < 0) throw std::runtime_error("open " + path + ": " + std::strerror(errno));
     struct stat st {};
-    if (::fstat(fd_, &st) != 0) throw std::runtime_error("fstat " + path + ": " + std::strerror(errno));
+    if (::fstat(fd_, &st) != 0) {
+        const int error = errno;
+        release_mapping();
+        throw std::runtime_error("fstat " + path + ": " + std::strerror(error));
+    }
     size_ = size_t(st.st_size);
-    if (size_ < 8) throw std::runtime_error(path + ": truncated safetensors file");
+    if (size_ < 8) {
+        release_mapping();
+        throw std::runtime_error(path + ": truncated safetensors file");
+    }
     void * mapped = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-    if (mapped == MAP_FAILED) throw std::runtime_error("mmap " + path + ": " + std::strerror(errno));
+    if (mapped == MAP_FAILED) {
+        const int error = errno;
+        release_mapping();
+        throw std::runtime_error("mmap " + path + ": " + std::strerror(error));
+    }
     mapping_ = static_cast<const uint8_t *>(mapped);
+#endif
 
-    const uint64_t header_size = read_u64_le(mapping_);
-    if (header_size > size_ - 8) throw std::runtime_error(path + ": invalid header size");
-    data_offset_ = 8 + header_size;
-    const auto header = nlohmann::json::parse(
-        reinterpret_cast<const char *>(mapping_ + 8),
-        reinterpret_cast<const char *>(mapping_ + data_offset_));
-    for (auto it = header.begin(); it != header.end(); ++it) {
-        if (it.key() == "__metadata__") continue;
-        safetensor_info info;
-        info.name = it.key();
-        info.dtype = it.value().at("dtype").get<std::string>();
-        info.shape = it.value().at("shape").get<std::vector<int64_t>>();
-        const auto offsets = it.value().at("data_offsets").get<std::vector<uint64_t>>();
-        if (offsets.size() != 2 || offsets[0] > offsets[1] || data_offset_ + offsets[1] > size_) {
-            throw std::runtime_error(path + ": invalid offsets for " + info.name);
+    try {
+        const uint64_t header_size = read_u64_le(mapping_);
+        if (header_size > size_ - 8) throw std::runtime_error(path + ": invalid header size");
+        data_offset_ = 8 + header_size;
+        const auto header = nlohmann::json::parse(
+            reinterpret_cast<const char *>(mapping_ + 8),
+            reinterpret_cast<const char *>(mapping_ + data_offset_));
+        for (auto it = header.begin(); it != header.end(); ++it) {
+            if (it.key() == "__metadata__") continue;
+            safetensor_info info;
+            info.name = it.key();
+            info.dtype = it.value().at("dtype").get<std::string>();
+            info.shape = it.value().at("shape").get<std::vector<int64_t>>();
+            const auto offsets = it.value().at("data_offsets").get<std::vector<uint64_t>>();
+            if (offsets.size() != 2 || offsets[0] > offsets[1] ||
+                data_offset_ + offsets[1] > size_) {
+                throw std::runtime_error(path + ": invalid offsets for " + info.name);
+            }
+            info.begin = offsets[0];
+            info.end = offsets[1];
+            index_.emplace(info.name, tensors_.size());
+            tensors_.push_back(std::move(info));
         }
-        info.begin = offsets[0];
-        info.end = offsets[1];
-        index_.emplace(info.name, tensors_.size());
-        tensors_.push_back(std::move(info));
+    } catch (...) {
+        release_mapping();
+        throw;
     }
 }
 
 safetensors_file::~safetensors_file() {
+    release_mapping();
+}
+
+void safetensors_file::release_mapping() noexcept {
+#ifdef _WIN32
+    if (mapping_) UnmapViewOfFile(mapping_);
+    if (mapping_handle_) CloseHandle(static_cast<HANDLE>(mapping_handle_));
+    if (file_handle_) CloseHandle(static_cast<HANDLE>(file_handle_));
+    mapping_handle_ = nullptr;
+    file_handle_ = nullptr;
+#else
     if (mapping_) ::munmap(const_cast<uint8_t *>(mapping_), size_);
     if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+#endif
+    mapping_ = nullptr;
+    size_ = 0;
 }
 
 const safetensor_info & safetensors_file::at(const std::string & name) const {

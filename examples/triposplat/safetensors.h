@@ -35,8 +35,15 @@ public:
     const uint8_t * data(const safetensor_info & info) const;
 
 private:
+    void release_mapping() noexcept;
+
     std::string path_;
+#ifdef _WIN32
+    void * file_handle_ = nullptr;
+    void * mapping_handle_ = nullptr;
+#else
     int fd_ = -1;
+#endif
     size_t size_ = 0;
     uint64_t data_offset_ = 0;
     const uint8_t * mapping_ = nullptr;
