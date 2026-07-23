@@ -341,13 +341,8 @@ generate_result pipeline::generate(const generate_options & options) {
     std::vector<float> latent(size_t(8192) * 16), camera(5);
     rng.fill_normal(latent.data(), latent.size());
     rng.fill_normal(camera.data(), camera.size());
-    const std::string asset_dir = options.asset_directory.empty()
-#ifdef TRIPOSPLAT_ASSET_DIR
-        ? TRIPOSPLAT_ASSET_DIR
-#else
-        ? "assets"
-#endif
-        : options.asset_directory;
+    const std::string asset_dir =
+        options.asset_directory.empty() ? "assets" : options.asset_directory;
     const host_tensor_archive position_archive = load_host_safetensors(
         (fs::path(asset_dir) / "flow_positions.safetensors").string());
     const host_tensor & positions = position_archive.at("positions");
