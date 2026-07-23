@@ -1,0 +1,71 @@
+#version 450
+
+// Dynamic im2col for modulated deformable convolution. The following ggml
+// MUL_MAT performs the output-channel contraction using its tiled Vulkan path.
+layout(push_constant) uniform parameter {
+    uint IW; uint IH; uint IC; uint N;
+    uint OW; uint OH; uint OC;
+    uint KW; uint KH;
+    int stride_w; int stride_h;
+    int pad_w; int pad_h;
+    uint elements;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X { float input_data[]; };
+layout(binding = 1) readonly buffer O { float offset_data[]; };
+layout(binding = 2) readonly buffer M { float mask_data[]; };
+layout(binding = 3) writeonly buffer D { float output_data[]; };
+
+float input_at(int x, int y, uint c, uint n) {
+    if (x < 0 || y < 0 || x >= int(p.IW) || y >= int(p.IH)) {
+        return 0.0;
+    }
+    return input_data[uint(x) + p.IW * (uint(y) + p.IH * (c + p.IC * n))];
+}
+
+float bilinear(float x, float y, uint c, uint n) {
+    const int x0 = int(floor(x));
+    const int y0 = int(floor(y));
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const float wx = x - float(x0);
+    const float wy = y - float(y0);
+    const float top = mix(input_at(x0, y0, c, n), input_at(x1, y0, c, n), wx);
+    const float bottom = mix(input_at(x0, y1, c, n), input_at(x1, y1, c, n), wx);
+    return mix(top, bottom, wy);
+}
+
+void main() {
+    // ggml may split a long 1-D launch over Vulkan's Y/Z workgroup axes.
+    const uint x_span = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    const uint y_span = gl_NumWorkGroups.y * gl_WorkGroupSize.y;
+    const uint idx = gl_GlobalInvocationID.x + x_span *
+        (gl_GlobalInvocationID.y + y_span * gl_GlobalInvocationID.z);
+    if (idx >= p.elements) {
+        return;
+    }
+
+    const uint kernel_points = p.KW * p.KH;
+    const uint features = p.IC * kernel_points;
+    uint q = idx;
+    const uint feature = q % features; q /= features;
+    const uint pixel = q % (p.OW * p.OH);
+    const uint n = q / (p.OW * p.OH);
+    const uint ow = pixel % p.OW;
+    const uint oh = pixel / p.OW;
+    const uint k = feature % kernel_points;
+    const uint c = feature / kernel_points;
+    const uint kx = k % p.KW;
+    const uint ky = k / p.KW;
+    const uint plane = p.OW * p.OH;
+    const uint offset_batch = plane * (2u * kernel_points) * n;
+    const uint mask_batch = plane * kernel_points * n;
+    const float offset_y = offset_data[pixel + offset_batch + plane * (2u * k)];
+    const float offset_x = offset_data[pixel + offset_batch + plane * (2u * k + 1u)];
+    const float mask = mask_data[pixel + mask_batch + plane * k];
+    const float sx = float(int(ow) * p.stride_w - p.pad_w + int(kx)) + offset_x;
+    const float sy = float(int(oh) * p.stride_h - p.pad_h + int(ky)) + offset_y;
+    output_data[idx] = bilinear(sx, sy, c, n) * mask;
+}
