@@ -1,5 +1,56 @@
 LIBRARY vulkan-1.dll
 EXPORTS
+    vkAllocateCommandBuffers
+    vkAllocateDescriptorSets
+    vkAllocateMemory
+    vkBeginCommandBuffer
+    vkBindBufferMemory
+    vkCmdBindDescriptorSets
+    vkCmdBindPipeline
     vkCmdCopyBuffer
+    vkCmdDispatch
+    vkCmdFillBuffer
+    vkCmdPipelineBarrier
+    vkCmdPushConstants
+    vkCmdResetQueryPool
+    vkCmdWriteTimestamp
+    vkCreateBuffer
+    vkCreateCommandPool
+    vkCreateComputePipelines
+    vkCreateDescriptorPool
+    vkCreateDescriptorSetLayout
+    vkCreateDevice
+    vkCreateInstance
+    vkCreatePipelineLayout
+    vkCreateQueryPool
+    vkCreateShaderModule
+    vkDestroyBuffer
+    vkDestroyCommandPool
+    vkDestroyDescriptorPool
+    vkDestroyDescriptorSetLayout
+    vkDestroyDevice
+    vkDestroyInstance
+    vkDestroyPipeline
+    vkDestroyPipelineLayout
+    vkDestroyQueryPool
+    vkDestroyShaderModule
+    vkDeviceWaitIdle
+    vkEndCommandBuffer
+    vkEnumeratePhysicalDevices
+    vkFlushMappedMemoryRanges
+    vkFreeCommandBuffers
+    vkFreeMemory
+    vkGetBufferMemoryRequirements
+    vkGetDeviceQueue
     vkGetInstanceProcAddr
     vkGetPhysicalDeviceFeatures2
+    vkGetPhysicalDeviceMemoryProperties
+    vkGetPhysicalDeviceProperties
+    vkGetPhysicalDeviceQueueFamilyProperties
+    vkGetQueryPoolResults
+    vkInvalidateMappedMemoryRanges
+    vkMapMemory
+    vkQueueSubmit
+    vkQueueWaitIdle
+    vkUnmapMemory
+    vkUpdateDescriptorSets

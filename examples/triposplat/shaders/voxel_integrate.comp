@@ -1,0 +1,252 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct PreparedGaussian {
+    vec4 mean_opacity;
+    vec4 cov0;
+    vec4 cov1_color;
+    vec4 aabb_min_color;
+    vec4 aabb_max;
+    vec4 cp0;
+    vec4 cp1;
+    vec4 cp2;
+    uvec4 bounds_lo_count;
+    uvec4 bounds_hi;
+};
+
+layout(std430, binding = 1) readonly buffer PreparedBuffer {
+    PreparedGaussian values[];
+} prepared_gaussians;
+
+layout(std430, binding = 2) readonly buffer OffsetBuffer {
+    uint values[];
+} pair_offsets;
+
+// Five float bit patterns per dense voxel: alpha, weight, weighted RGB.
+layout(std430, binding = 3) buffer AccumulationBuffer {
+    uint values[];
+} accumulation;
+
+layout(push_constant) uniform PushConstants {
+    uint gaussian_count;
+    uint total_pairs;
+    uint resolution;
+    uint integration_steps;
+    float iso;
+    float tolerance;
+    float color_weight_power;
+    float opacity_threshold;
+} pc;
+
+bool aabb_inside_voxel(vec3 aabb_min, vec3 aabb_max, vec3 voxel,
+                       float voxel_size) {
+    return all(lessThanEqual(voxel, aabb_min)) &&
+           all(greaterThanEqual(voxel + vec3(voxel_size), aabb_max));
+}
+
+bool voxel_overlap_aabb(vec3 aabb_min, vec3 aabb_max, vec3 voxel,
+                        float voxel_size) {
+    return all(greaterThanEqual(aabb_max, voxel)) &&
+           all(lessThanEqual(aabb_min, voxel + vec3(voxel_size)));
+}
+
+bool edge_test(float c0, float c1, float c2, float c3, float c4, float c5,
+               float iso, float s, float t, float lower, float upper) {
+    const float a = c0;
+    const float b = 2.0 * (c1 * s + c2 * t);
+    const float c = c3 * s * s + 2.0 * c4 * s * t + c5 * t * t - iso;
+    const float discriminant = max(b * b - 4.0 * a * c, 0.0);
+    if (discriminant <= 0.0 || abs(a) <= 1e-30) {
+        return false;
+    }
+    const float center = -0.5 * b / a;
+    const float radius = 0.5 * sqrt(discriminant) / a;
+    const float root0 = center - radius;
+    const float root1 = center + radius;
+    return !(upper <= root0 || root1 <= lower);
+}
+
+bool voxel_edges_intersect(PreparedGaussian g, vec3 voxel,
+                           float voxel_size) {
+    const vec3 p = voxel - g.mean_opacity.xyz;
+    const float c0 = g.cov0.x;
+    const float c1 = g.cov0.y;
+    const float c2 = g.cov0.z;
+    const float c3 = g.cov0.w;
+    const float c4 = g.cov1_color.x;
+    const float c5 = g.cov1_color.y;
+    for (int i = 0; i < 4; ++i) {
+        const float first = float(i / 2) * voxel_size;
+        const float second = float(i % 2) * voxel_size;
+        if (edge_test(c0, c1, c2, c3, c4, c5, pc.iso,
+                      p.y + first, p.z + second, p.x, p.x + voxel_size)) {
+            return true;
+        }
+        if (edge_test(c3, c1, c4, c0, c2, c5, pc.iso,
+                      p.x + first, p.z + second, p.y, p.y + voxel_size)) {
+            return true;
+        }
+        if (edge_test(c5, c2, c4, c0, c1, c3, pc.iso,
+                      p.x + first, p.y + second, p.z, p.z + voxel_size)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool face_test(vec3 p, vec3 q, float voxel_size, int i, int j, int k,
+               float face_offset) {
+    if (abs(q[i]) <= 1e-30) {
+        return false;
+    }
+    const float t =
+        (q[i] - (p[i] + face_offset)) / (2.0 * q[i]);
+    if (t < 0.0 || t > 1.0) {
+        return false;
+    }
+    const vec3 hit = (1.0 - 2.0 * t) * q;
+    return p[j] <= hit[j] && hit[j] <= p[j] + voxel_size &&
+           p[k] <= hit[k] && hit[k] <= p[k] + voxel_size;
+}
+
+bool voxel_faces_intersect(PreparedGaussian g, vec3 voxel,
+                           float voxel_size) {
+    const vec3 p = voxel - g.mean_opacity.xyz;
+    const vec3 cp0 = g.cp0.xyz;
+    const vec3 cp1 = g.cp1.xyz;
+    const vec3 cp2 = g.cp2.xyz;
+    return face_test(p, cp0, voxel_size, 0, 1, 2, 0.0) ||
+           face_test(p, cp0, voxel_size, 0, 1, 2, voxel_size) ||
+           face_test(p, cp1, voxel_size, 1, 0, 2, 0.0) ||
+           face_test(p, cp1, voxel_size, 1, 0, 2, voxel_size) ||
+           face_test(p, cp2, voxel_size, 2, 0, 1, 0.0) ||
+           face_test(p, cp2, voxel_size, 2, 0, 1, voxel_size);
+}
+
+bool voxel_intersects(PreparedGaussian g, vec3 voxel, float voxel_size) {
+    if (aabb_inside_voxel(g.aabb_min_color.xyz, g.aabb_max.xyz,
+                          voxel, voxel_size)) {
+        return true;
+    }
+    if (!voxel_overlap_aabb(g.aabb_min_color.xyz, g.aabb_max.xyz,
+                            voxel, voxel_size)) {
+        return false;
+    }
+    if (voxel_faces_intersect(g, voxel, voxel_size)) {
+        return true;
+    }
+    return voxel_edges_intersect(g, voxel, voxel_size);
+}
+
+void atomic_add_float(uint index, float value) {
+    uint old_value = accumulation.values[index];
+    for (;;) {
+        const uint expected = old_value;
+        const float current = uintBitsToFloat(expected);
+        const uint desired = floatBitsToUint(current + value);
+        old_value = atomicCompSwap(accumulation.values[index],
+                                   expected, desired);
+        if (old_value == expected) {
+            return;
+        }
+    }
+}
+
+void atomic_composite_alpha(uint index, float value) {
+    uint old_value = accumulation.values[index];
+    for (;;) {
+        const uint expected = old_value;
+        const float current = uintBitsToFloat(expected);
+        const uint desired =
+            floatBitsToUint(value + current - value * current);
+        old_value = atomicCompSwap(accumulation.values[index],
+                                   expected, desired);
+        if (old_value == expected) {
+            return;
+        }
+    }
+}
+
+void main() {
+    const uint pair_index = gl_GlobalInvocationID.x;
+    if (pair_index >= pc.total_pairs) {
+        return;
+    }
+
+    // upper_bound(offsets, pair_index) - 1
+    uint lower = 0;
+    uint upper = pc.gaussian_count;
+    while (lower + 1 < upper) {
+        const uint middle = lower + (upper - lower) / 2;
+        if (pair_offsets.values[middle] <= pair_index) {
+            lower = middle;
+        } else {
+            upper = middle;
+        }
+    }
+    const uint gaussian_index = lower;
+    const PreparedGaussian g = prepared_gaussians.values[gaussian_index];
+    const uint local_index =
+        pair_index - pair_offsets.values[gaussian_index];
+    const uvec3 dimensions =
+        g.bounds_hi.xyz - g.bounds_lo_count.xyz + uvec3(1);
+    const uint local_x = local_index % dimensions.x;
+    const uint local_y =
+        (local_index / dimensions.x) % dimensions.y;
+    const uint local_z =
+        local_index / (dimensions.x * dimensions.y);
+    const uvec3 cell =
+        g.bounds_lo_count.xyz + uvec3(local_x, local_y, local_z);
+    const float voxel_size = 2.0 / float(pc.resolution);
+    const vec3 voxel = vec3(cell) * voxel_size - vec3(1.0);
+    if (!voxel_intersects(g, voxel, voxel_size)) {
+        return;
+    }
+
+    const float c0 = g.cov0.x;
+    const float c1 = g.cov0.y;
+    const float c2 = g.cov0.z;
+    const float c3 = g.cov0.w;
+    const float c4 = g.cov1_color.x;
+    const float c5 = g.cov1_color.y;
+    const uint steps = pc.integration_steps;
+    const float step_size =
+        voxel_size / float(steps > 1 ? steps - 1 : 1);
+    float integral = 0.0;
+    for (uint i = 0; i < steps; ++i) {
+        const float vx =
+            voxel.x + float(i) * step_size - g.mean_opacity.x;
+        const float a = c0 * vx * vx;
+        for (uint j = 0; j < steps; ++j) {
+            const float vy =
+                voxel.y + float(j) * step_size - g.mean_opacity.y;
+            const float partial =
+                a + 2.0 * c1 * vx * vy + c3 * vy * vy;
+            for (uint k = 0; k < steps; ++k) {
+                const float vz =
+                    voxel.z + float(k) * step_size - g.mean_opacity.z;
+                const float quadratic =
+                    partial + 2.0 * c2 * vx * vz +
+                    2.0 * c4 * vy * vz + c5 * vz * vz;
+                integral += exp(-0.5 * quadratic);
+            }
+        }
+    }
+    const float sample_count = float(steps * steps * steps);
+    const float alpha =
+        clamp(g.mean_opacity.w * integral / sample_count, 0.0, 1.0);
+    const float weight =
+        pow(max(alpha, 1e-12), pc.color_weight_power);
+    const vec3 color =
+        vec3(g.cov1_color.z, g.cov1_color.w, g.aabb_min_color.w);
+    const uint linear =
+        cell.x + pc.resolution *
+        (cell.y + pc.resolution * cell.z);
+    const uint base = linear * 5;
+    atomic_composite_alpha(base, alpha);
+    atomic_add_float(base + 1, weight);
+    atomic_add_float(base + 2, weight * color.r);
+    atomic_add_float(base + 3, weight * color.g);
+    atomic_add_float(base + 4, weight * color.b);
+}

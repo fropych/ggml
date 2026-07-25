@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 3) readonly buffer AccumulationBuffer {
+    uint values[];
+} accumulation;
+
+layout(std430, binding = 4) writeonly buffer RecordBuffer {
+    uvec4 values[];
+} records;
+
+layout(std430, binding = 5) buffer CounterBuffer {
+    uint value;
+} counter;
+
+layout(push_constant) uniform PushConstants {
+    uint gaussian_count;
+    uint total_pairs;
+    uint resolution;
+    uint integration_steps;
+    float iso;
+    float tolerance;
+    float color_weight_power;
+    float opacity_threshold;
+} pc;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const uint voxel_count =
+        pc.resolution * pc.resolution * pc.resolution;
+    if (index >= voxel_count) {
+        return;
+    }
+    const uint base = index * 5;
+    const float alpha = uintBitsToFloat(accumulation.values[base]);
+    if (alpha < pc.opacity_threshold) {
+        return;
+    }
+    const float weight =
+        max(uintBitsToFloat(accumulation.values[base + 1]), 1e-12);
+    const vec3 color = clamp(
+        vec3(uintBitsToFloat(accumulation.values[base + 2]),
+             uintBitsToFloat(accumulation.values[base + 3]),
+             uintBitsToFloat(accumulation.values[base + 4])) / weight,
+        vec3(0.0), vec3(1.0));
+    const uint output_index = atomicAdd(counter.value, 1);
+    records.values[output_index] =
+        uvec4(index, floatBitsToUint(color.r),
+              floatBitsToUint(color.g), floatBitsToUint(color.b));
+}

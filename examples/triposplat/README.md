@@ -65,6 +65,7 @@ triposplat-linux-x86_64/
 ├── libggml-base.so.0
 ├── assets/flow_positions.safetensors
 ├── README.md
+├── VOXEL_FORMAT.md
 └── LICENSE
 ```
 
@@ -84,6 +85,41 @@ cd triposplat-linux-x86_64
 
 The CLI resolves `assets/` relative to its own executable path, so it may be
 started from any working directory.
+
+## Gaussian PLY to sparse voxels
+
+`voxelize` converts a binary little-endian Gaussian-splat PLY directly on a
+Vulkan GPU. It does not run the neural network and does not create a mesh:
+
+```sh
+./builds/vulkan-cm2/bin/triposplat-vulkan voxelize \
+  ../output/result.ply \
+  --output ../output/result_64.tsvox \
+  --resolution 64
+```
+
+The defaults reproduce the selected Python/Kaolin reference configuration:
+`iso=11.345`, occupancy threshold `0.10`, tolerance `0.125`, 10 samples per
+voxel axis, and color-weight power `0.625`. The grid resolution must be a
+power of two. Use `--device N` to select the raw Vulkan physical-device index.
+
+The output is a small, dependency-free sparse binary rather than an NPZ
+archive. Its exact 128-byte header, 16-byte RGB record, index order, grid fit,
+and minimal C++ declarations are specified in
+[VOXEL_FORMAT.md](VOXEL_FORMAT.md).
+
+For development, compare a result against the Python reference contract with:
+
+```sh
+../TripoSplat/.venv/bin/python \
+  examples/triposplat/test_voxel_parity.py \
+  ../output/result_64.tsvox \
+  ../output/voxel_joint_64/best_64.npz
+```
+
+The test validates the complete file structure, exact occupancy, origin and
+voxel size, conversion parameters, and RGB error bounds. NumPy is a test-only
+dependency and is not used or linked by the converter.
 
 ## Cross-build Windows x86-64 on Linux
 

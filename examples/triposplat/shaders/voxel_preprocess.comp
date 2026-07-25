@@ -1,0 +1,133 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct RawGaussian {
+    vec4 mean_opacity;
+    vec4 scale_color_r;
+    vec4 rotation;
+    vec4 color_gb;
+};
+
+struct PreparedGaussian {
+    vec4 mean_opacity;
+    vec4 cov0;
+    vec4 cov1_color;
+    vec4 aabb_min_color;
+    vec4 aabb_max;
+    vec4 cp0;
+    vec4 cp1;
+    vec4 cp2;
+    uvec4 bounds_lo_count;
+    uvec4 bounds_hi;
+};
+
+layout(std430, binding = 0) readonly buffer RawBuffer {
+    RawGaussian values[];
+} raw_gaussians;
+
+layout(std430, binding = 1) writeonly buffer PreparedBuffer {
+    PreparedGaussian values[];
+} prepared_gaussians;
+
+layout(std430, binding = 2) writeonly buffer CountBuffer {
+    uint values[];
+} pair_counts;
+
+layout(push_constant) uniform PushConstants {
+    uint gaussian_count;
+    uint total_pairs;
+    uint resolution;
+    uint integration_steps;
+    float iso;
+    float tolerance;
+    float color_weight_power;
+    float opacity_threshold;
+} pc;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    if (index >= pc.gaussian_count) {
+        return;
+    }
+
+    const RawGaussian raw = raw_gaussians.values[index];
+    const vec3 mean = raw.mean_opacity.xyz;
+    const float voxel_size = 2.0 / float(pc.resolution);
+    const vec3 scale = max(raw.scale_color_r.xyz,
+                           vec3(pc.tolerance * voxel_size));
+    const vec4 q = normalize(raw.rotation);
+    const float r = q.x;
+    const float x = q.y;
+    const float y = q.z;
+    const float z = q.w;
+
+    // This is the same inverse-covariance construction used by Kaolin's
+    // gs_to_spc CUDA kernel: M = inverse(scale) * R, covariance_inv = M^T M.
+    const float r00 = 1.0 - 2.0 * (y * y + z * z);
+    const float r01 = 2.0 * (x * y + r * z);
+    const float r02 = 2.0 * (x * z - r * y);
+    const float r10 = 2.0 * (x * y - r * z);
+    const float r11 = 1.0 - 2.0 * (x * x + z * z);
+    const float r12 = 2.0 * (y * z + r * x);
+    const float r20 = 2.0 * (x * z + r * y);
+    const float r21 = 2.0 * (y * z - r * x);
+    const float r22 = 1.0 - 2.0 * (x * x + y * y);
+
+    const vec3 m0 = vec3(r00, r01, r02) / scale.x;
+    const vec3 m1 = vec3(r10, r11, r12) / scale.y;
+    const vec3 m2 = vec3(r20, r21, r22) / scale.z;
+
+    const float c0 = m0.x * m0.x + m1.x * m1.x + m2.x * m2.x;
+    const float c1 = m0.x * m0.y + m1.x * m1.y + m2.x * m2.y;
+    const float c2 = m0.x * m0.z + m1.x * m1.z + m2.x * m2.z;
+    const float c3 = m0.y * m0.y + m1.y * m1.y + m2.y * m2.y;
+    const float c4 = m0.y * m0.z + m1.y * m1.z + m2.y * m2.z;
+    const float c5 = m0.z * m0.z + m1.z * m1.z + m2.z * m2.z;
+
+    const float h0 = c3 * c5 - c4 * c4;
+    const float h1 = c2 * c4 - c1 * c5;
+    const float h2 = c1 * c4 - c2 * c3;
+    const float h3 = c0 * c5 - c2 * c2;
+    const float h4 = c1 * c2 - c0 * c4;
+    const float h5 = c0 * c3 - c1 * c1;
+    const float det_scale = scale.x * scale.y * scale.z;
+
+    const vec3 cp0 = det_scale * sqrt(pc.iso / max(h0, 1e-30)) *
+                     vec3(h0, h1, h2);
+    const vec3 cp1 = det_scale * sqrt(pc.iso / max(h3, 1e-30)) *
+                     vec3(h1, h3, h4);
+    const vec3 cp2 = det_scale * sqrt(pc.iso / max(h5, 1e-30)) *
+                     vec3(h2, h4, h5);
+    const vec3 extent = max(abs(cp0), max(abs(cp1), abs(cp2)));
+    const vec3 aabb_min = mean - extent;
+    const vec3 aabb_max = mean + extent;
+
+    PreparedGaussian prepared;
+    prepared.mean_opacity = raw.mean_opacity;
+    prepared.cov0 = vec4(c0, c1, c2, c3);
+    prepared.cov1_color =
+        vec4(c4, c5, raw.scale_color_r.w, raw.color_gb.x);
+    prepared.aabb_min_color = vec4(aabb_min, raw.color_gb.y);
+    prepared.aabb_max = vec4(aabb_max, 0.0);
+    prepared.cp0 = vec4(cp0, 0.0);
+    prepared.cp1 = vec4(cp1, 0.0);
+    prepared.cp2 = vec4(cp2, 0.0);
+
+    uint count = 0;
+    ivec3 lower = ivec3(0);
+    ivec3 upper = ivec3(0);
+    if (all(greaterThanEqual(aabb_max, vec3(-1.0))) &&
+        all(lessThanEqual(aabb_min, vec3(1.0)))) {
+        lower = clamp(ivec3(floor((aabb_min + vec3(1.0)) / voxel_size)),
+                      ivec3(0), ivec3(int(pc.resolution) - 1));
+        upper = clamp(ivec3(floor((aabb_max + vec3(1.0)) / voxel_size)),
+                      ivec3(0), ivec3(int(pc.resolution) - 1));
+        const uvec3 dimensions = uvec3(upper - lower + ivec3(1));
+        count = dimensions.x * dimensions.y * dimensions.z;
+    }
+    prepared.bounds_lo_count = uvec4(uvec3(lower), count);
+    prepared.bounds_hi = uvec4(uvec3(upper), 0);
+    prepared_gaussians.values[index] = prepared;
+    pair_counts.values[index] = count;
+}
