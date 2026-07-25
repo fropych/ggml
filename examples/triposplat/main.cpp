@@ -24,6 +24,7 @@
 #include <cmath>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -54,7 +55,7 @@ static void usage(const char * argv0) {
         "  --color-weight-power F Integrated-opacity color power (default: 0.625)\n"
         "  --iso F                Gaussian isocontour (default: 11.345)\n"
         "  --tolerance F          Minimum relative Gaussian scale (default: 0.125)\n"
-        "  --integration-steps N  Samples per voxel axis (default: 10)\n"
+        "  --integration-steps N  Samples per voxel axis, 1..256 (default: 10)\n"
         "  --device N             Vulkan device index (default: 0)\n\n"
         "  %s --inspect MODEL.safetensors\n"
         "  %s --load MODEL.safetensors [--f16]\n\n"
@@ -81,6 +82,19 @@ static std::string option_value(int & index, int argc, char ** argv) {
     if (++index >= argc) throw std::invalid_argument(
         std::string("missing value after ") + argv[index - 1]);
     return argv[index];
+}
+
+static uint32_t uint32_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const uint64_t parsed = std::stoull(value, &consumed);
+    if (consumed != value.size() ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument(
+            std::string("invalid uint32 value for ") + option);
+    }
+    return uint32_t(parsed);
 }
 
 static std::filesystem::path executable_directory(const char * argv0) {
@@ -134,7 +148,7 @@ static int run_cli_command(int argc, char ** argv) {
                 options.output_path = option_value(i, argc, argv);
             } else if (option == "--resolution") {
                 options.resolution =
-                    uint32_t(std::stoul(option_value(i, argc, argv)));
+                    uint32_option(i, argc, argv, "--resolution");
             } else if (option == "--opacity-threshold") {
                 options.opacity_threshold =
                     std::stof(option_value(i, argc, argv));
@@ -149,7 +163,7 @@ static int run_cli_command(int argc, char ** argv) {
                     std::stof(option_value(i, argc, argv));
             } else if (option == "--integration-steps") {
                 options.integration_steps =
-                    uint32_t(std::stoul(option_value(i, argc, argv)));
+                    uint32_option(i, argc, argv, "--integration-steps");
             } else if (option == "--device") {
                 options.vulkan_device =
                     std::stoi(option_value(i, argc, argv));

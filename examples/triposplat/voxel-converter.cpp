@@ -981,6 +981,7 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
           options.opacity_threshold <= 1.0f) ||
         !(options.tolerance > 0.0f) ||
         options.integration_steps == 0 ||
+        options.integration_steps > 256 ||
         !(options.color_weight_power > 0.0f)) {
         throw std::invalid_argument(
             "invalid voxel conversion parameters");
