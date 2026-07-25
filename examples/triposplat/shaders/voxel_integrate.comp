@@ -223,12 +223,15 @@ void main() {
                 voxel.y + float(j) * step_size - g.mean_opacity.y;
             const float partial =
                 a + 2.0 * c1 * vx * vy + c3 * vy * vy;
+            // Factor the two cross terms before the innermost sample loop,
+            // so their x/y products are computed once rather than per z.
+            const float z_linear =
+                2.0 * (c2 * vx + c4 * vy);
             for (uint k = 0; k < steps; ++k) {
                 const float vz =
                     voxel.z + float(k) * step_size - g.mean_opacity.z;
                 const float quadratic =
-                    partial + 2.0 * c2 * vx * vz +
-                    2.0 * c4 * vy * vz + c5 * vz * vz;
+                    partial + z_linear * vz + c5 * vz * vz;
                 integral += exp(-0.5 * quadratic);
             }
         }
