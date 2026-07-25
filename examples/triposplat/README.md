@@ -85,6 +85,43 @@ cd triposplat-linux-x86_64
 The CLI resolves `assets/` relative to its own executable path, so it may be
 started from any working directory.
 
+## Cross-build Windows x86-64 on Linux
+
+Install CMake, Ninja, curl, `nlohmann-json3-dev`, and the MinGW-w64 x86-64 C/C++
+toolchain. Point `VULKAN_SDK` at a Linux Vulkan SDK; its native `glslc` compiles
+the embedded SPIR-V while MinGW builds the Windows host code:
+
+```sh
+VULKAN_SDK=/opt/vulkan-sdk/x86_64 \
+  ./examples/triposplat/build-windows-cross.sh
+```
+
+The script downloads and verifies libwebp 1.3.2, cross-builds WebP and
+SharpYUV statically, creates the Vulkan loader import library, and writes:
+
+```text
+builds/windows-x86_64/triposplat-windows-x86_64.zip
+```
+
+The archive contains the console executable, runtime asset, README, and
+license. ggml, the Vulkan backend, WebP, SharpYUV, libstdc++, and libgcc are
+linked statically; OpenMP and the CPU backend are disabled. The executable
+therefore imports only `KERNEL32.dll`, `msvcrt.dll`, and `vulkan-1.dll`.
+The first two are Windows system libraries. `vulkan-1.dll` is supplied by the
+installed NVIDIA/AMD/Intel graphics driver; do not copy a Linux Vulkan library
+into the package.
+
+Run from PowerShell or `cmd.exe`:
+
+```powershell
+.\triposplat-vulkan.exe download --model-dir .\ckpts
+.\triposplat-vulkan.exe generate .\input.webp `
+  --model-dir .\ckpts --output .\output
+```
+
+The downloader invokes the `curl.exe` bundled with current Windows versions.
+For older Windows installations, place a compatible `curl.exe` on `PATH`.
+
 ## Native C++ end-to-end CLI
 
 `triposplat-vulkan generate` runs image decoding/preprocessing, DINO, stochastic

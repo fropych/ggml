@@ -24,6 +24,11 @@
 #include <chrono>
 #include <filesystem>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 using namespace triposplat;
 
 static void usage(const char * argv0) {
@@ -70,7 +75,15 @@ static std::string option_value(int & index, int argc, char ** argv) {
 
 static std::filesystem::path executable_directory(const char * argv0) {
     std::error_code error;
-#ifdef __linux__
+#ifdef _WIN32
+    std::wstring executable_path(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(
+        nullptr, executable_path.data(), DWORD(executable_path.size()));
+    if (length > 0 && length < executable_path.size()) {
+        executable_path.resize(length);
+        return std::filesystem::path(executable_path).parent_path();
+    }
+#elif defined(__linux__)
     const std::filesystem::path proc_path =
         std::filesystem::read_symlink("/proc/self/exe", error);
     if (!error && !proc_path.empty()) return proc_path.parent_path();

@@ -1,0 +1,5 @@
+LIBRARY vulkan-1.dll
+EXPORTS
+    vkCmdCopyBuffer
+    vkGetInstanceProcAddr
+    vkGetPhysicalDeviceFeatures2
