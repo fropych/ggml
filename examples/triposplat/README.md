@@ -121,6 +121,24 @@ The test validates the complete file structure, exact occupancy, origin and
 voxel size, conversion parameters, and RGB error bounds. NumPy is a test-only
 dependency and is not used or linked by the converter.
 
+Reference measurements for `output/result.ply` on an NVIDIA A100-SXM4-40GB
+are below. Times are medians of seven runs. `conversion` excludes output-file
+writing and the separately reported one-time Vulkan instance/device/pipeline
+setup, matching the warmed Python/Kaolin conversion benchmark. Memory is the
+conservative peak of all converter Vulkan allocations, including staging and
+readback buffers.
+
+| Grid | Python conversion | Vulkan conversion | Vulkan/Python | Vulkan GPU | Vulkan allocations | Python max allocated | Memory ratio |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32³ | 12.497 ms | 11.858 ms | 0.949x | 1.568 ms | 8.62 MiB | 51.05 MiB | 0.169x |
+| 64³ | 26.063 ms | 18.628 ms | 0.715x | 3.804 ms | 17.19 MiB | 122.04 MiB | 0.141x |
+| 128³ | 111.062 ms | 116.154 ms | 1.046x | 18.945 ms | 85.51 MiB | 498.12 MiB | 0.172x |
+
+The one-time Vulkan setup was approximately 270–290 ms on this driver and is
+printed separately by the CLI. A long-lived caller can reuse a converter
+context in a future API; the current command intentionally favors a small,
+standalone implementation.
+
 ## Cross-build Windows x86-64 on Linux
 
 Install CMake, Ninja, curl, `nlohmann-json3-dev`, and the MinGW-w64 x86-64 C/C++
