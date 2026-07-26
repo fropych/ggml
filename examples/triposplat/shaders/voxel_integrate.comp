@@ -39,6 +39,8 @@ layout(push_constant) uniform PushConstants {
     float opacity_threshold;
     uint chunk_z_begin;
     uint chunk_z_count;
+    uint output_z_begin;
+    uint output_z_count;
     uint work_item_base;
     uint reserved;
 } pc;

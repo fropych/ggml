@@ -25,9 +25,16 @@ layout(push_constant) uniform PushConstants {
     float opacity_threshold;
     uint chunk_z_begin;
     uint chunk_z_count;
+    uint output_z_begin;
+    uint output_z_count;
     uint work_item_base;
     uint reserved;
 } pc;
+
+bool occupied(uint index) {
+    return uintBitsToFloat(accumulation.values[index * 5]) >=
+           pc.opacity_threshold;
+}
 
 void main() {
     const uint index =
@@ -37,9 +44,28 @@ void main() {
     if (index >= voxel_count) {
         return;
     }
+    const uint plane = pc.resolution * pc.resolution;
+    const uint local_z = index / plane;
+    const uint global_z = pc.chunk_z_begin + local_z;
+    if (global_z < pc.output_z_begin ||
+        global_z >= pc.output_z_begin + pc.output_z_count) {
+        return;
+    }
     const uint base = index * 5;
     const float alpha = uintBitsToFloat(accumulation.values[base]);
     if (alpha < pc.opacity_threshold) {
+        return;
+    }
+    const uint x = index % pc.resolution;
+    const uint y = (index / pc.resolution) % pc.resolution;
+    const bool interior =
+        x > 0 && occupied(index - 1) &&
+        x + 1 < pc.resolution && occupied(index + 1) &&
+        y > 0 && occupied(index - pc.resolution) &&
+        y + 1 < pc.resolution && occupied(index + pc.resolution) &&
+        global_z > 0 && occupied(index - plane) &&
+        global_z + 1 < pc.resolution && occupied(index + plane);
+    if (interior) {
         return;
     }
     const float weight =
@@ -51,7 +77,7 @@ void main() {
         vec3(0.0), vec3(1.0));
     const uint output_index = atomicAdd(counter.value, 1);
     const uint global_index =
-        index + pc.chunk_z_begin * pc.resolution * pc.resolution;
+        x + pc.resolution * (y + pc.resolution * global_z);
     records.values[output_index] =
         uvec4(global_index, floatBitsToUint(color.r),
               floatBitsToUint(color.g), floatBitsToUint(color.b));

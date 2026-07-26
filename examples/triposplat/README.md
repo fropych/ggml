@@ -106,17 +106,20 @@ physical-device index.
 
 Large grids are processed as consecutive Z chunks. The converter caps a chunk
 at 33,554,432 voxels and reduces it further when required by the device's
-`maxStorageBufferRange`. Only the current chunk has dense accumulation and
-record buffers; the global output remains a compact CPU occupancy bitset plus
-RGB8 stream. `--chunk-depth N` can impose a smaller Z depth for testing or
-memory tuning; zero/default selects the automatic depth.
+`maxStorageBufferRange`. Each chunk includes up to one extra Z halo plane on
+either side, allowing the finalize shader to check face neighbours at chunk
+boundaries. Only owned cells are emitted. `--chunk-depth N` limits owned Z
+layers for testing or memory tuning; zero/default selects the automatic depth.
 
 The output is a small, dependency-free binary rather than an NPZ archive.
 TSVOXEL v2 stores one occupancy bit per dense voxel followed by one three-byte
-RGB8 value per set bit. GPU output is sorted by `linear_index` on CPU before
-the bitset and ordered color stream are materialized. Its exact 128-byte
-header, bit order, quantization rule, grid fit, and minimal C++ declaration
-are specified in [VOXEL_FORMAT.md](VOXEL_FORMAT.md).
+RGB8 value per set bit. It always removes a cell whose six face neighbours are
+all occupied, leaving the one-voxel surface shell. The filtering runs in the
+Vulkan finalize shader and is not iterative erosion. GPU output is sorted by
+`linear_index` on CPU before the bitset and ordered color stream are
+materialized. Its exact 128-byte header, mandatory surface flag, bit order,
+quantization rule, grid fit, and minimal C++ declaration are specified in
+[VOXEL_FORMAT.md](VOXEL_FORMAT.md).
 
 For development, compare a result against the Python reference contract with:
 
@@ -127,33 +130,29 @@ For development, compare a result against the Python reference contract with:
   ../output/voxel_joint_64/best_64.npz
 ```
 
-The test validates the complete v2 file structure, bitset padding and
-population, exact occupancy, origin and voxel size, conversion parameters,
-RGB8 bytes against a quantized Python reference, and decoded RGB error bounds.
-Pass `--baseline-tsvoxel FILE` to additionally require exact baseline
-occupancy and bounded RGB8 differences. This is the regression contract used
-to compare chunked and monolithic Vulkan output. For very large files without
-a reference, `--structure-only` validates the header, sizes, padding, and
-occupancy population as a streaming pass without materializing a dense NumPy
-grid.
+The test validates the complete v2 file structure, mandatory surface flag,
+bitset padding and population, the absence of fully enclosed cells, exact
+six-neighbour surface occupancy derived from the Python volume, origin and
+voxel size, conversion parameters, RGB8 bytes, and decoded RGB error bounds.
+Pass `--baseline-tsvoxel FILE` to derive the expected shell from a legacy
+filled-volume TSVOXEL or compare directly with a surface-shell TSVOXEL.
+For very large files without a reference, `--structure-only` validates the
+header, sizes, padding, population, and surface-shell invariant plane by plane
+without materializing a dense `N^3` NumPy grid.
 NumPy is a test-only dependency and is not used or linked by the converter.
 
 Reference measurements for `output/result.ply` on an NVIDIA A100-SXM4-40GB
-are below. Times are medians of seven runs. `conversion` excludes output-file
-writing and the separately reported one-time Vulkan instance/device/pipeline
-setup, matching the warmed Python/Kaolin conversion benchmark. Memory is the
-conservative peak of all converter Vulkan allocations, including staging and
-readback buffers.
+are below. Times are medians of three process runs. `conversion` includes GPU
+work, readback, CPU sorting, bitset construction, and RGB8 quantization. It
+excludes output writing and the separately reported one-time Vulkan setup.
 
-| Grid | Python conversion | Vulkan conversion | Vulkan/Python | Vulkan GPU | Vulkan allocations | Python max allocated | Memory ratio |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 32³ | 12.497 ms | 12.956 ms | 1.037x | 1.598 ms | 8.62 MiB | 51.05 MiB | 0.169x |
-| 64³ | 26.063 ms | 22.150 ms | 0.850x | 3.835 ms | 17.19 MiB | 122.04 MiB | 0.141x |
-| 128³ | 111.062 ms | 100.463 ms | 0.905x | 19.105 ms | 85.51 MiB | 498.12 MiB | 0.172x |
-
-CPU sorting, bitset construction, and RGB8 quantization are included in the
-Vulkan `conversion` time. The `Vulkan GPU` column contains only timestamped
-GPU work.
+| Grid | Surface voxels | Surface conversion | Vulkan GPU | Vulkan allocations | TSVOXEL v2 |
+|---:|---:|---:|---:|---:|---:|
+| 32³ | 3,923 | 13.129 ms | 1.567 ms | 8.56 MiB | 15,993 bytes |
+| 64³ | 17,909 | 18.626 ms | 3.828 ms | 16.65 MiB | 86,623 bytes |
+| 128³ | 77,303 | 45.174 ms | 19.039 ms | 80.55 MiB | 494,181 bytes |
+| 256³ | 342,716 | 176.908 ms | 90.496 ms | 588.60 MiB | 3,125,428 bytes |
+| 512³ | 1,457,821 | 1,049.402 ms | 573.342 ms | 1,157.89 MiB | 21,150,807 bytes |
 
 The memory-chunked implementation was also benchmarked directly against the
 monolithic implementation through 1024³. At 512³ it reduces peak Vulkan
@@ -163,11 +162,11 @@ device-local; the old implementation fails. Full methodology, timings, memory
 figures, and parity results are in
 [VOXEL_CHUNKING_BENCHMARK.md](VOXEL_CHUNKING_BENCHMARK.md).
 
-| Grid | TSVOXEL v2 | Python NPZ | v2 reduction vs NPZ |
-|---:|---:|---:|---:|
-| 32³ | 27,624 bytes | 92,951 bytes | 70.3% |
-| 64³ | 193,348 bytes | 620,796 bytes | 68.9% |
-| 128³ | 1,468,248 bytes | 4,564,827 bytes | 67.8% |
+Mandatory surface filtering was benchmarked against that filled-volume
+chunked implementation through 512³. It reduces the 512³ file by 77.0% and
+accelerates the conversion phase by 4.714x. Full wall times, GPU timings,
+allocation peaks, output sizes, and parity evidence are in
+[VOXEL_SURFACE_BENCHMARK.md](VOXEL_SURFACE_BENCHMARK.md).
 
 The one-time Vulkan setup was approximately 270–290 ms on this driver and is
 printed separately by the CLI. A long-lived caller can reuse a converter

@@ -298,10 +298,12 @@ struct push_constants {
     float opacity_threshold;
     uint32_t chunk_z_begin;
     uint32_t chunk_z_count;
+    uint32_t output_z_begin;
+    uint32_t output_z_count;
     uint32_t work_item_base;
     uint32_t reserved;
 };
-static_assert(sizeof(push_constants) == 48);
+static_assert(sizeof(push_constants) == 56);
 
 class vulkan_context;
 
@@ -1033,7 +1035,8 @@ void write_voxel_file(
     header.integration_steps = options.integration_steps;
     // little-endian header, LSB-first occupancy bitset, RGB entries ordered
     // by increasing linear voxel index.
-    header.flags = 1u | 2u | 4u;
+    // Base v2 encodings plus mandatory six-neighbour surface-shell semantics.
+    header.flags = 1u | 2u | 4u | 8u;
     header.source_gaussian_count = gaussian_count;
     header.occupancy_bytes = payload.occupancy.size();
     header.color_bytes = payload.colors.size();
@@ -1217,20 +1220,35 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
         throw std::runtime_error(
             "maxStorageBufferRange cannot hold one voxel Z plane");
     }
-    uint32_t maximum_chunk_z = uint32_t(std::min<uint64_t>(
+    const uint32_t maximum_buffer_z = uint32_t(std::min<uint64_t>(
         options.resolution, maximum_chunk_voxels / plane_voxels));
-    if (options.chunk_depth > 0) {
-        maximum_chunk_z = std::min(
-            maximum_chunk_z, options.chunk_depth);
+    uint32_t maximum_output_z = options.resolution;
+    if (maximum_buffer_z < options.resolution) {
+        if (maximum_buffer_z < 3) {
+            throw std::runtime_error(
+                "maxStorageBufferRange cannot hold a voxel chunk plus "
+                "two Z halo planes");
+        }
+        maximum_output_z = maximum_buffer_z - 2;
     }
+    if (options.chunk_depth > 0) {
+        maximum_output_z = std::min(
+            maximum_output_z, options.chunk_depth);
+    }
+    const uint32_t allocated_buffer_z =
+        maximum_output_z == options.resolution
+            ? options.resolution
+            : std::min(options.resolution, maximum_output_z + 2);
     const uint32_t allocated_chunk_voxels = uint32_t(
-        plane_voxels * maximum_chunk_z);
+        plane_voxels * allocated_buffer_z);
+    const uint32_t allocated_output_voxels = uint32_t(
+        plane_voxels * maximum_output_z);
 
     vk_buffer accumulation_buffer = context.create_buffer(
         uint64_t(allocated_chunk_voxels) * 5 * sizeof(uint32_t),
         storage | transfer_destination, device_memory);
     vk_buffer record_buffer = context.create_buffer(
-        uint64_t(allocated_chunk_voxels) * sizeof(voxel_record_gpu),
+        uint64_t(allocated_output_voxels) * sizeof(voxel_record_gpu),
         storage | transfer_source, device_memory);
     vk_buffer counter_buffer = context.create_buffer(
         sizeof(uint32_t), storage | transfer_destination,
@@ -1252,7 +1270,9 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
         options.color_weight_power,
         options.opacity_threshold,
         0,
-        maximum_chunk_z,
+        allocated_buffer_z,
+        0,
+        maximum_output_z,
         0,
         0,
     };
@@ -1266,16 +1286,25 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
     uint32_t largest_chunk_voxels = 0;
     double gpu_milliseconds = 0.0;
 
-    uint32_t chunk_z_begin = 0;
-    while (chunk_z_begin < options.resolution) {
-        uint32_t chunk_z_count = std::min(
-            maximum_chunk_z,
-            options.resolution - chunk_z_begin);
+    uint32_t output_z_begin = 0;
+    while (output_z_begin < options.resolution) {
+        uint32_t output_z_count = std::min(
+            maximum_output_z,
+            options.resolution - output_z_begin);
+        const uint32_t chunk_z_begin =
+            output_z_begin > 0 ? output_z_begin - 1 : 0;
+        uint32_t chunk_z_count =
+            std::min(
+                options.resolution,
+                output_z_begin + output_z_count + 1) -
+            chunk_z_begin;
         uint64_t chunk_pairs_64 = 0;
 
         for (;;) {
             constants.chunk_z_begin = chunk_z_begin;
             constants.chunk_z_count = chunk_z_count;
+            constants.output_z_begin = output_z_begin;
+            constants.output_z_count = output_z_count;
             constants.total_pairs = 0;
             context.update_binding(2, count_buffer);
 
@@ -1316,12 +1345,17 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
                 }
                 break;
             }
-            if (chunk_z_count == 1) {
+            if (output_z_count == 1) {
                 throw std::overflow_error(
-                    "one voxel Z plane exceeds uint32 Gaussian "
+                    "one output Z plane plus halo exceeds uint32 Gaussian "
                     "candidate indexing");
             }
-            chunk_z_count = std::max(1u, chunk_z_count / 2);
+            output_z_count = std::max(1u, output_z_count / 2);
+            chunk_z_count =
+                std::min(
+                    options.resolution,
+                    output_z_begin + output_z_count + 1) -
+                chunk_z_begin;
         }
 
         constants.total_pairs = uint32_t(chunk_pairs_64);
@@ -1384,9 +1418,11 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
 
         const uint32_t occupied =
             *static_cast<const uint32_t *>(counter_buffer.mapped);
-        if (occupied > chunk_voxel_count) {
+        const uint32_t output_voxel_count = uint32_t(
+            plane_voxels * output_z_count);
+        if (occupied > output_voxel_count) {
             throw std::runtime_error(
-                "Vulkan voxel counter exceeded chunk size");
+                "Vulkan surface voxel counter exceeded output chunk size");
         }
 
         vk_buffer readback_buffer = context.create_buffer(
@@ -1410,7 +1446,7 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
         total_pairs_64 += chunk_pairs_64;
         occupied_total += occupied;
         ++chunk_count;
-        chunk_z_begin += chunk_z_count;
+        output_z_begin += output_z_count;
     }
     const auto conversion_end = std::chrono::steady_clock::now();
     write_voxel_file(

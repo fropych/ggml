@@ -2,8 +2,9 @@
 
 `TSVOXEL` is a dependency-free voxel file written by
 `triposplat-vulkan voxelize`. Version 2 stores occupancy as one bit per dense
-voxel and stores one RGB8 triplet per occupied voxel. All header integers and
-IEEE-754 floats are little-endian.
+voxel and stores one RGB8 triplet per occupied surface voxel. Fully enclosed
+voxels are removed by the mandatory six-face-neighbour rule described below.
+All header integers and IEEE-754 floats are little-endian.
 
 ```text
 +-----------------------------+ 0
@@ -49,10 +50,35 @@ Required `flags` bits:
 | 0 | Header values are little-endian |
 | 1 | Occupancy is an LSB-first bitset |
 | 2 | RGB entries follow set bits in increasing `linear_index` |
+| 3 | Occupancy contains only the six-neighbour surface shell |
 
 Readers must use `header_bytes` to find the bitset and reject files with
 unknown required encodings. A future version may use a header larger than
 128 bytes.
+
+## Surface-shell invariant
+
+For every occupied cell, the converter checks the two face neighbours on each
+axis. The cell is omitted if all six neighbours are also occupied:
+
+```text
+(x-1,y,z), (x+1,y,z), (x,y-1,z),
+(x,y+1,z), (x,y,z-1), (x,y,z+1)
+```
+
+A neighbour outside the grid is empty. Edge- and corner-touching cells are not
+neighbours for this rule. Filtering is one pass against the original
+integrated occupancy, not repeated erosion.
+
+The Vulkan converter integrates Z chunks with one halo plane on each available
+side. A memory barrier makes all accumulated opacity values visible before the
+finalize shader checks neighbours. Halo cells are checked but only owned cells
+are emitted, so chunk boundaries have the same result as one full-grid pass.
+
+TSVOXEL v2 therefore represents a renderable shell, not a filled solid.
+Consumers performing volumetric operations, slices, collision, or inside-view
+rendering must account for that semantic. The bitset still covers the complete
+`N^3` address space to preserve constant-time coordinate lookup.
 
 ## Linear voxel order
 

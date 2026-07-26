@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate TSVOXEL v2 and compare it with the NumPy reference."""
+"""Validate surface-only TSVOXEL v2 against volume references."""
 
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ import numpy as np
 
 
 HEADER = struct.Struct("<8s6I2Q3f5f2I5Q")
-REQUIRED_FLAGS = 1 | 2 | 4
+BASE_FLAGS = 1 | 2 | 4
+SURFACE_SHELL_FLAG = 8
+REQUIRED_FLAGS = BASE_FLAGS | SURFACE_SHELL_FLAG
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class VoxelFile:
     color_weight_power: float
     integration_steps: int
     source_gaussian_count: int
+    flags: int
     occupancy: np.ndarray
     colors_rgb8: np.ndarray
 
@@ -82,8 +85,8 @@ def validate_structure_streaming(path: Path) -> None:
             raise ValueError(
                 f"{path}: unsupported axis/color encoding"
             )
-        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS:
-            raise ValueError(f"{path}: required v2 flags are missing")
+        if flags != REQUIRED_FLAGS:
+            raise ValueError(f"{path}: unsupported v2 flags 0x{flags:x}")
         if occupied_count != record_count:
             raise ValueError(
                 f"{path}: occupied_count != record_count"
@@ -128,13 +131,55 @@ def validate_structure_streaming(path: Path) -> None:
                 f"{path}: bitset contains {population} occupied "
                 f"voxels, header says {occupied_count}"
             )
+        plane_bits = resolution * resolution
+
+        def read_plane(z: int) -> np.ndarray:
+            bit_begin = z * plane_bits
+            bit_end = bit_begin + plane_bits
+            byte_begin = bit_begin // 8
+            byte_end = (bit_end + 7) // 8
+            stream.seek(header_bytes + byte_begin)
+            packed = stream.read(byte_end - byte_begin)
+            if len(packed) != byte_end - byte_begin:
+                raise ValueError(f"{path}: truncated occupancy bitset")
+            bits = np.unpackbits(
+                np.frombuffer(packed, dtype=np.uint8), bitorder="little"
+            )
+            offset = bit_begin - byte_begin * 8
+            return bits[offset:offset + plane_bits].reshape(
+                resolution, resolution
+            ).astype(bool)
+
+        if resolution > 2:
+            previous = read_plane(0)
+            current = read_plane(1)
+            for z in range(1, resolution - 1):
+                following = read_plane(z + 1)
+                interior = current & previous & following
+                interior[0, :] = False
+                interior[-1, :] = False
+                interior[:, 0] = False
+                interior[:, -1] = False
+                interior[1:, :] &= current[:-1, :]
+                interior[:-1, :] &= current[1:, :]
+                interior[:, 1:] &= current[:, :-1]
+                interior[:, :-1] &= current[:, 1:]
+                enclosed = int(np.count_nonzero(interior))
+                if enclosed:
+                    raise ValueError(
+                        f"{path}: Z plane {z} contains {enclosed} "
+                        "fully enclosed voxels"
+                    )
+                previous, current = current, following
     print(
         f"N={resolution}: streaming structure valid, "
         f"occupied={occupied_count}, bytes={file_size}"
     )
 
 
-def load_tsvoxel(path: Path) -> VoxelFile:
+def load_tsvoxel(
+    path: Path, *, require_surface_shell: bool = True
+) -> VoxelFile:
     data = path.read_bytes()
     if len(data) < HEADER.size:
         raise ValueError(f"{path}: truncated header")
@@ -176,8 +221,13 @@ def load_tsvoxel(path: Path) -> VoxelFile:
         raise ValueError(f"{path}: resolution is not a power of two")
     if axis_order != 0 or color_type != 2 or record_bytes != 3:
         raise ValueError(f"{path}: unsupported axis/color encoding")
-    if flags & REQUIRED_FLAGS != REQUIRED_FLAGS:
-        raise ValueError(f"{path}: required v2 flags are missing")
+    allowed_flags = (
+        {REQUIRED_FLAGS}
+        if require_surface_shell
+        else {BASE_FLAGS, REQUIRED_FLAGS}
+    )
+    if flags not in allowed_flags:
+        raise ValueError(f"{path}: unsupported v2 flags 0x{flags:x}")
     if occupied_count != record_count:
         raise ValueError(f"{path}: occupied_count != record_count")
     voxel_count = resolution**3
@@ -237,6 +287,7 @@ def load_tsvoxel(path: Path) -> VoxelFile:
         color_weight_power=color_weight_power,
         integration_steps=integration_steps,
         source_gaussian_count=source_gaussian_count,
+        flags=flags,
         occupancy=occupancy_flat.reshape(shape),
         colors_rgb8=colors.reshape((*shape, 3)),
     )
@@ -262,6 +313,33 @@ def quantize_rgb8(colors: np.ndarray) -> np.ndarray:
     return np.floor(scaled).astype(np.uint8)
 
 
+def surface_shell(occupancy: np.ndarray) -> np.ndarray:
+    """Retain occupied cells with at least one empty/out-of-grid face neighbour."""
+    occupancy = np.asarray(occupancy, dtype=bool)
+    interior = occupancy.copy()
+    interior[0, :, :] = False
+    interior[-1, :, :] = False
+    interior[:, 0, :] = False
+    interior[:, -1, :] = False
+    interior[:, :, 0] = False
+    interior[:, :, -1] = False
+    interior[1:, :, :] &= occupancy[:-1, :, :]
+    interior[:-1, :, :] &= occupancy[1:, :, :]
+    interior[:, 1:, :] &= occupancy[:, :-1, :]
+    interior[:, :-1, :] &= occupancy[:, 1:, :]
+    interior[:, :, 1:] &= occupancy[:, :, :-1]
+    interior[:, :, :-1] &= occupancy[:, :, 1:]
+    return occupancy & ~interior
+
+
+def assert_surface_shell(occupancy: np.ndarray) -> None:
+    interior_count = int(np.count_nonzero(occupancy & ~surface_shell(occupancy)))
+    if interior_count:
+        raise AssertionError(
+            f"output contains {interior_count} fully enclosed voxels"
+        )
+
+
 def compare_tsvoxel(
     actual: VoxelFile,
     baseline: VoxelFile,
@@ -270,7 +348,6 @@ def compare_tsvoxel(
 ) -> None:
     scalar_fields = (
         "resolution",
-        "occupied_count",
         "voxel_size",
         "iso",
         "opacity_threshold",
@@ -287,9 +364,20 @@ def compare_tsvoxel(
             )
     if not np.array_equal(actual.origin, baseline.origin):
         raise AssertionError("baseline origin differs")
-    if not np.array_equal(actual.occupancy, baseline.occupancy):
+    expected_occupancy = (
+        baseline.occupancy
+        if baseline.flags & SURFACE_SHELL_FLAG
+        else surface_shell(baseline.occupancy)
+    )
+    expected_count = int(np.count_nonzero(expected_occupancy))
+    if actual.occupied_count != expected_count:
+        raise AssertionError(
+            f"surface occupied_count: {actual.occupied_count} != "
+            f"{expected_count}"
+        )
+    if not np.array_equal(actual.occupancy, expected_occupancy):
         xor_count = int(np.count_nonzero(
-            actual.occupancy ^ baseline.occupancy
+            actual.occupancy ^ expected_occupancy
         ))
         raise AssertionError(
             f"baseline occupancy differs at {xor_count} voxels"
@@ -297,7 +385,7 @@ def compare_tsvoxel(
 
     byte_error = np.abs(
         actual.colors_rgb8[actual.occupancy].astype(np.int16)
-        - baseline.colors_rgb8[baseline.occupancy].astype(np.int16)
+        - baseline.colors_rgb8[expected_occupancy].astype(np.int16)
     )
     mismatch_count = int(np.count_nonzero(byte_error))
     mismatch_rate = (
@@ -377,6 +465,7 @@ def compare(
         else:
             check_close(field, actual_value, float(expected_value), 1e-6)
 
+    expected_occupancy = surface_shell(expected_occupancy)
     intersection = np.count_nonzero(actual.occupancy & expected_occupancy)
     union = np.count_nonzero(actual.occupancy | expected_occupancy)
     xor_count = np.count_nonzero(actual.occupancy ^ expected_occupancy)
@@ -474,8 +563,11 @@ def main() -> int:
                 print("PASS")
                 return 0
         actual = load_tsvoxel(args.tsvoxel)
+        assert_surface_shell(actual.occupancy)
         if args.baseline_tsvoxel is not None:
-            baseline = load_tsvoxel(args.baseline_tsvoxel)
+            baseline = load_tsvoxel(
+                args.baseline_tsvoxel, require_surface_shell=False
+            )
             compare_tsvoxel(
                 actual,
                 baseline,

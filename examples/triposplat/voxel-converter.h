@@ -35,7 +35,8 @@ struct voxel_conversion_result {
 };
 
 // Convert a binary little-endian Gaussian-splat PLY to the dependency-free
-// TSVOXEL v2 occupancy-bitset/RGB8 format using Vulkan compute.
+// TSVOXEL v2 six-neighbour surface-shell occupancy-bitset/RGB8 format using
+// Vulkan compute.
 voxel_conversion_result convert_gaussian_ply_to_voxels(
     const voxel_conversion_options & options);
 
