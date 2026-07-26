@@ -40,7 +40,7 @@ jobs:
     needs: prepare-release
     runs-on: ubuntu-24.04
     env:
-      VULKAN_SDK: ${{ runner.temp }}/vulkan-sdk/1.4.350.1/x86_64
+      VULKAN_SDK: ${{ github.workspace }}/.vulkan-sdk/1.4.350.1/x86_64
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v6
@@ -66,8 +66,8 @@ jobs:
             "https://sdk.lunarg.com/sdk/download/1.4.350.1/linux/vulkan_sdk.tar.xz"
           echo "6cce33c7e5383814150c5041820769d93c65a1fd883002e5949b067045a07daa  ${archive}" \
             | sha256sum --check -
-          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
-          tar -xJf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
+          mkdir -p "${GITHUB_WORKSPACE}/.vulkan-sdk"
+          tar -xJf "${archive}" -C "${GITHUB_WORKSPACE}/.vulkan-sdk"
           "${VULKAN_SDK}/bin/glslc" --version
 
       - name: Configure TripoSplat
@@ -117,7 +117,7 @@ jobs:
     needs: prepare-release
     runs-on: ubuntu-24.04
     env:
-      VULKAN_SDK: ${{ runner.temp }}/vulkan-sdk/1.4.350.1/x86_64
+      VULKAN_SDK: ${{ github.workspace }}/.vulkan-sdk/1.4.350.1/x86_64
     steps:
       - name: Checkout release tag
         uses: actions/checkout@v6
@@ -143,8 +143,8 @@ jobs:
             "https://sdk.lunarg.com/sdk/download/1.4.350.1/linux/vulkan_sdk.tar.xz"
           echo "6cce33c7e5383814150c5041820769d93c65a1fd883002e5949b067045a07daa  ${archive}" \
             | sha256sum --check -
-          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
-          tar -xJf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
+          mkdir -p "${GITHUB_WORKSPACE}/.vulkan-sdk"
+          tar -xJf "${archive}" -C "${GITHUB_WORKSPACE}/.vulkan-sdk"
           "${VULKAN_SDK}/bin/glslc" --version
 
       - name: Build portable Windows archive
