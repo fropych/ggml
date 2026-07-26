@@ -50,7 +50,7 @@ static void usage(const char * argv0) {
         "  --download             Download missing weights from Hugging Face\n"
         "  --keep-temp            Preserve intermediate safetensors\n\n"
         "Voxelize options:\n"
-        "  --resolution N         Cubic power-of-two grid (default: 64)\n"
+        "  --resolution N         Cubic power-of-two grid, 2..1024 (default: 64)\n"
         "  --opacity-threshold F  Occupancy threshold (default: 0.10)\n"
         "  --color-weight-power F Integrated-opacity color power (default: 0.625)\n"
         "  --iso F                Gaussian isocontour (default: 11.345)\n"

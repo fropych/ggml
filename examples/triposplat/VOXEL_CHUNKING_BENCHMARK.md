@@ -1,8 +1,7 @@
 # Memory-chunked voxel conversion benchmark
 
 This benchmark compares the monolithic TSVOXEL v2 converter at commit
-`6ccc53a3` with the Z-chunked implementation on branch
-`agent/triposplat-voxel-chunked`.
+`6ccc53a3` with the memory-chunked implementation in this change.
 
 ## Method
 
