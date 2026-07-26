@@ -13,6 +13,7 @@
 #include "e2e-worker.h"
 #include "pipeline.h"
 #include "model-store.h"
+#include "voxel-converter.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <cmath>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -35,6 +37,7 @@ static void usage(const char * argv0) {
     std::fprintf(stderr,
         "Usage:\n"
         "  %s generate IMAGE --model-dir DIR [--output PREFIX] [OPTIONS]\n"
+        "  %s voxelize INPUT.ply --output OUTPUT.tsvox [OPTIONS]\n"
         "  %s download --model-dir DIR [--repo REPO] [--revision REV]\n\n"
         "Generate options:\n"
         "  --steps N              Flow steps (default: 20)\n"
@@ -46,6 +49,15 @@ static void usage(const char * argv0) {
         "  --assets DIR           Runtime asset directory\n"
         "  --download             Download missing weights from Hugging Face\n"
         "  --keep-temp            Preserve intermediate safetensors\n\n"
+        "Voxelize options:\n"
+        "  --resolution N         Cubic power-of-two grid, 2..1024 (default: 64)\n"
+        "  --opacity-threshold F  Occupancy threshold (default: 0.10)\n"
+        "  --color-weight-power F Integrated-opacity color power (default: 0.625)\n"
+        "  --iso F                Gaussian isocontour (default: 11.345)\n"
+        "  --tolerance F          Minimum relative Gaussian scale (default: 0.125)\n"
+        "  --integration-steps N  Samples per voxel axis, 1..256 (default: 10)\n"
+        "  --chunk-depth N        Owned Z layers per GPU chunk; halo is automatic\n"
+        "  --device N             Vulkan device index (default: 0)\n\n"
         "  %s --inspect MODEL.safetensors\n"
         "  %s --load MODEL.safetensors [--f16]\n\n"
         "  %s --flow-parity MODEL.safetensors INPUTS.safetensors [BLOCKS]\n\n"
@@ -63,14 +75,53 @@ static void usage(const char * argv0) {
         "  %s --run-flow MODEL.safetensors INPUT.safetensors OUTPUT.safetensors [STEPS] [GUIDANCE]\n"
         "  %s --run-decode MODEL.safetensors INPUT.safetensors OUTPUT_PREFIX [GAUSSIANS] [SEED]\n\n"
         "The executable initializes Vulkan directly; it never creates a CPU backend.\n",
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static std::string option_value(int & index, int argc, char ** argv) {
     if (++index >= argc) throw std::invalid_argument(
         std::string("missing value after ") + argv[index - 1]);
     return argv[index];
+}
+
+static uint32_t uint32_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const uint64_t parsed = std::stoull(value, &consumed);
+    if (consumed != value.size() ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument(
+            std::string("invalid uint32 value for ") + option);
+    }
+    return uint32_t(parsed);
+}
+
+static float float_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const float parsed = std::stof(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(parsed)) {
+        throw std::invalid_argument(
+            std::string("invalid finite float value for ") + option);
+    }
+    return parsed;
+}
+
+static int int_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const long long parsed = std::stoll(value, &consumed);
+    if (consumed != value.size() ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(
+            std::string("invalid int value for ") + option);
+    }
+    return int(parsed);
 }
 
 static std::filesystem::path executable_directory(const char * argv0) {
@@ -109,6 +160,76 @@ static int run_cli_command(int argc, char ** argv) {
         if (config.directory.empty()) throw std::invalid_argument("--model-dir is required");
         download_models(config);
         std::printf("models are ready in %s\n", std::filesystem::absolute(config.directory).c_str());
+        return 0;
+    }
+    if (command == "voxelize") {
+        if (argc < 3) {
+            throw std::invalid_argument(
+                "voxelize requires an input Gaussian PLY");
+        }
+        voxel_conversion_options options;
+        options.input_ply = argv[2];
+        for (int i = 3; i < argc; ++i) {
+            const std::string option = argv[i];
+            if (option == "--output") {
+                options.output_path = option_value(i, argc, argv);
+            } else if (option == "--resolution") {
+                options.resolution =
+                    uint32_option(i, argc, argv, "--resolution");
+            } else if (option == "--opacity-threshold") {
+                options.opacity_threshold =
+                    float_option(i, argc, argv, "--opacity-threshold");
+            } else if (option == "--color-weight-power") {
+                options.color_weight_power =
+                    float_option(i, argc, argv, "--color-weight-power");
+            } else if (option == "--iso") {
+                options.iso =
+                    float_option(i, argc, argv, "--iso");
+            } else if (option == "--tolerance") {
+                options.tolerance =
+                    float_option(i, argc, argv, "--tolerance");
+            } else if (option == "--integration-steps") {
+                options.integration_steps =
+                    uint32_option(i, argc, argv, "--integration-steps");
+            } else if (option == "--chunk-depth") {
+                options.chunk_depth =
+                    uint32_option(i, argc, argv, "--chunk-depth");
+            } else if (option == "--device") {
+                options.vulkan_device =
+                    int_option(i, argc, argv, "--device");
+            } else {
+                throw std::invalid_argument(
+                    "unknown voxelize option: " + option);
+            }
+        }
+        if (options.output_path.empty()) {
+            throw std::invalid_argument(
+                "voxelize requires --output");
+        }
+        const voxel_conversion_result result =
+            convert_gaussian_ply_to_voxels(options);
+        std::printf(
+            "Vulkan device: %s\n"
+            "Gaussian voxelization: %.3f ms GPU, %.3f ms conversion, "
+            "%.3f ms setup\n"
+            "Gaussians: %llu, AABB candidates: %llu, surface voxels: %llu\n"
+            "Chunks: %u, largest: %u voxels\n"
+            "Peak Vulkan allocations: %.2f MiB total, "
+            "%.2f MiB device-local\n"
+            "%s (%llu bytes)\n",
+            result.device_name.c_str(),
+            result.gpu_milliseconds,
+            result.conversion_milliseconds,
+            result.setup_milliseconds,
+            static_cast<unsigned long long>(result.gaussian_count),
+            static_cast<unsigned long long>(result.aabb_candidate_pairs),
+            static_cast<unsigned long long>(result.occupied_voxels),
+            result.chunk_count,
+            result.max_chunk_voxels,
+            double(result.converter_gpu_bytes) / (1024.0 * 1024.0),
+            double(result.converter_device_bytes) / (1024.0 * 1024.0),
+            options.output_path.c_str(),
+            static_cast<unsigned long long>(result.output_bytes));
         return 0;
     }
     if (command != "generate") return -1;

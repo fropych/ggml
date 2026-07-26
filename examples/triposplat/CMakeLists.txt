@@ -4,6 +4,38 @@ find_library(TRIPOSPLAT_SHARPYUV_STATIC_LIBRARY
     NAMES libsharpyuv.a sharpyuv.a sharpyuv REQUIRED)
 find_path(TRIPOSPLAT_WEBP_INCLUDE_DIR webp/decode.h REQUIRED)
 find_path(TRIPOSPLAT_NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp REQUIRED)
+find_package(Vulkan COMPONENTS glslc REQUIRED)
+
+set(TRIPOSPLAT_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+set(TRIPOSPLAT_GENERATED_SHADER_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated-shaders")
+file(MAKE_DIRECTORY "${TRIPOSPLAT_GENERATED_SHADER_DIR}")
+set(TRIPOSPLAT_SHADER_HEADERS)
+foreach(SHADER_NAME voxel_preprocess voxel_integrate voxel_finalize)
+    set(SHADER_SOURCE "${TRIPOSPLAT_SHADER_DIR}/${SHADER_NAME}.comp")
+    set(SHADER_SPV
+        "${TRIPOSPLAT_GENERATED_SHADER_DIR}/${SHADER_NAME}.spv")
+    set(SHADER_HEADER
+        "${TRIPOSPLAT_GENERATED_SHADER_DIR}/${SHADER_NAME}.spv.h")
+    add_custom_command(
+        OUTPUT "${SHADER_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -O
+                --target-env=vulkan1.2
+                -o "${SHADER_SPV}" "${SHADER_SOURCE}"
+        DEPENDS "${SHADER_SOURCE}"
+        VERBATIM)
+    add_custom_command(
+        OUTPUT "${SHADER_HEADER}"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DINPUT=${SHADER_SPV}"
+                "-DOUTPUT=${SHADER_HEADER}"
+                "-DSYMBOL=triposplat_${SHADER_NAME}_spv"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed-spirv.cmake"
+        DEPENDS "${SHADER_SPV}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed-spirv.cmake"
+        VERBATIM)
+    list(APPEND TRIPOSPLAT_SHADER_HEADERS "${SHADER_HEADER}")
+endforeach()
 
 add_library(triposplat-core STATIC
     safetensors.cpp
@@ -20,16 +52,20 @@ add_library(triposplat-core STATIC
     model-store.cpp
     pipeline.cpp
     triposplat-c.cpp
+    voxel-converter.cpp
+    ${TRIPOSPLAT_SHADER_HEADERS}
 )
 set_target_properties(triposplat-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(triposplat-core
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE
         ${TRIPOSPLAT_WEBP_INCLUDE_DIR}
-        ${TRIPOSPLAT_NLOHMANN_JSON_INCLUDE_DIR})
+        ${TRIPOSPLAT_NLOHMANN_JSON_INCLUDE_DIR}
+        ${TRIPOSPLAT_GENERATED_SHADER_DIR})
 target_link_libraries(triposplat-core PUBLIC
     ggml
     ggml-vulkan
+    Vulkan::Vulkan
     ${TRIPOSPLAT_WEBP_STATIC_LIBRARY}
     ${TRIPOSPLAT_SHARPYUV_STATIC_LIBRARY}
 )
@@ -79,6 +115,15 @@ install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/assets/flow_positions.safetensors"
     DESTINATION assets
     COMPONENT triposplat-portable)
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+    DESTINATION .
+    COMPONENT triposplat-portable)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/VOXEL_FORMAT.md"
+    DESTINATION .
+    COMPONENT triposplat-portable)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/VOXEL_CHUNKING_BENCHMARK.md"
+    DESTINATION .
+    COMPONENT triposplat-portable)
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/VOXEL_SURFACE_BENCHMARK.md"
     DESTINATION .
     COMPONENT triposplat-portable)
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE"

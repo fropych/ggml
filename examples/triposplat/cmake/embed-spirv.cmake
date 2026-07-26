@@ -1,0 +1,28 @@
+if(NOT DEFINED INPUT OR NOT DEFINED OUTPUT OR NOT DEFINED SYMBOL)
+    message(FATAL_ERROR "embed-spirv.cmake requires INPUT, OUTPUT and SYMBOL")
+endif()
+
+file(READ "${INPUT}" SPIRV_HEX HEX)
+string(REGEX MATCHALL ".." SPIRV_BYTES "${SPIRV_HEX}")
+file(WRITE "${OUTPUT}"
+    "#pragma once\n#include <cstddef>\n#include <cstdint>\n"
+    "alignas(4) static const uint8_t ${SYMBOL}[] = {\n")
+set(COLUMN 0)
+foreach(BYTE IN LISTS SPIRV_BYTES)
+    if(COLUMN EQUAL 0)
+        file(APPEND "${OUTPUT}" "    ")
+    endif()
+    file(APPEND "${OUTPUT}" "0x${BYTE},")
+    math(EXPR COLUMN "${COLUMN} + 1")
+    if(COLUMN EQUAL 16)
+        file(APPEND "${OUTPUT}" "\n")
+        set(COLUMN 0)
+    else()
+        file(APPEND "${OUTPUT}" " ")
+    endif()
+endforeach()
+if(NOT COLUMN EQUAL 0)
+    file(APPEND "${OUTPUT}" "\n")
+endif()
+file(APPEND "${OUTPUT}"
+    "};\nstatic constexpr size_t ${SYMBOL}_size = sizeof(${SYMBOL});\n")

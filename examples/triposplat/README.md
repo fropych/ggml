@@ -65,6 +65,7 @@ triposplat-linux-x86_64/
 ├── libggml-base.so.0
 ├── assets/flow_positions.safetensors
 ├── README.md
+├── VOXEL_FORMAT.md
 └── LICENSE
 ```
 
@@ -84,6 +85,93 @@ cd triposplat-linux-x86_64
 
 The CLI resolves `assets/` relative to its own executable path, so it may be
 started from any working directory.
+
+## Gaussian PLY to sparse voxels
+
+`voxelize` converts a binary little-endian Gaussian-splat PLY directly on a
+Vulkan GPU. It does not run the neural network and does not create a mesh:
+
+```sh
+./builds/vulkan-cm2/bin/triposplat-vulkan voxelize \
+  ../output/result.ply \
+  --output ../output/result_64.tsvox \
+  --resolution 64
+```
+
+The defaults reproduce the selected Python/Kaolin reference configuration:
+`iso=11.345`, occupancy threshold `0.10`, tolerance `0.125`, 10 samples per
+voxel axis, and color-weight power `0.625`. The grid resolution must be a
+power of two in `[2, 1024]`. Use `--device N` to select the raw Vulkan
+physical-device index.
+
+Large grids are processed as consecutive Z chunks. The converter caps a chunk
+at 33,554,432 voxels and reduces it further when required by the device's
+`maxStorageBufferRange`. Each chunk includes up to one extra Z halo plane on
+either side, allowing the finalize shader to check face neighbours at chunk
+boundaries. Only owned cells are emitted. `--chunk-depth N` limits owned Z
+layers for testing or memory tuning; zero/default selects the automatic depth.
+
+The output is a small, dependency-free binary rather than an NPZ archive.
+TSVOXEL v2 stores one occupancy bit per dense voxel followed by one three-byte
+RGB8 value per set bit. It always removes a cell whose six face neighbours are
+all occupied, leaving the one-voxel surface shell. The filtering runs in the
+Vulkan finalize shader and is not iterative erosion. GPU output is sorted by
+`linear_index` on CPU before the bitset and ordered color stream are
+materialized. Its exact 128-byte header, mandatory surface flag, bit order,
+quantization rule, grid fit, and minimal C++ declaration are specified in
+[VOXEL_FORMAT.md](VOXEL_FORMAT.md).
+
+For development, compare a result against the Python reference contract with:
+
+```sh
+../TripoSplat/.venv/bin/python \
+  examples/triposplat/test_voxel_parity.py \
+  ../output/result_64.tsvox \
+  ../output/voxel_joint_64/best_64.npz
+```
+
+The test validates the complete v2 file structure, mandatory surface flag,
+bitset padding and population, the absence of fully enclosed cells, exact
+six-neighbour surface occupancy derived from the Python volume, origin and
+voxel size, conversion parameters, RGB8 bytes, and decoded RGB error bounds.
+Pass `--baseline-tsvoxel FILE` to derive the expected shell from a legacy
+filled-volume TSVOXEL or compare directly with a surface-shell TSVOXEL.
+For very large files without a reference, `--structure-only` validates the
+header, sizes, padding, population, and surface-shell invariant plane by plane
+without materializing a dense `N^3` NumPy grid.
+NumPy is a test-only dependency and is not used or linked by the converter.
+
+Reference measurements for `output/result.ply` on an NVIDIA A100-SXM4-40GB
+are below. Times are medians of three process runs. `conversion` includes GPU
+work, readback, CPU sorting, bitset construction, and RGB8 quantization. It
+excludes output writing and the separately reported one-time Vulkan setup.
+
+| Grid | Surface voxels | Surface conversion | Vulkan GPU | Vulkan allocations | TSVOXEL v2 |
+|---:|---:|---:|---:|---:|---:|
+| 32³ | 3,923 | 13.129 ms | 1.567 ms | 8.56 MiB | 15,993 bytes |
+| 64³ | 17,909 | 18.626 ms | 3.828 ms | 16.65 MiB | 86,623 bytes |
+| 128³ | 77,303 | 45.174 ms | 19.039 ms | 80.55 MiB | 494,181 bytes |
+| 256³ | 342,716 | 176.908 ms | 90.496 ms | 588.60 MiB | 3,125,428 bytes |
+| 512³ | 1,457,821 | 1,049.402 ms | 573.342 ms | 1,157.89 MiB | 21,150,807 bytes |
+
+The memory-chunked implementation was also benchmarked directly against the
+monolithic implementation through 1024³. At 512³ it reduces peak Vulkan
+allocations from 4,998.75 MiB to 1,314.84 MiB with effectively unchanged
+conversion time. At 1024³ it uses 1,365.05 MiB total / 1,157.13 MiB
+device-local; the old implementation fails. Full methodology, timings, memory
+figures, and parity results are in
+[VOXEL_CHUNKING_BENCHMARK.md](VOXEL_CHUNKING_BENCHMARK.md).
+
+Mandatory surface filtering was benchmarked against that filled-volume
+chunked implementation through 512³. It reduces the 512³ file by 77.0% and
+accelerates the conversion phase by 4.714x. Full wall times, GPU timings,
+allocation peaks, output sizes, and parity evidence are in
+[VOXEL_SURFACE_BENCHMARK.md](VOXEL_SURFACE_BENCHMARK.md).
+
+The one-time Vulkan setup was approximately 270–290 ms on this driver and is
+printed separately by the CLI. A long-lived caller can reuse a converter
+context in a future API; the current command intentionally favors a small,
+standalone implementation.
 
 ## Cross-build Windows x86-64 on Linux
 
