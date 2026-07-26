@@ -246,14 +246,14 @@ struct alignas(16) prepared_gaussian_gpu {
 };
 static_assert(sizeof(prepared_gaussian_gpu) == 160);
 
-struct voxel_record_v1 {
+struct voxel_record_gpu {
     uint32_t linear_index;
     float color[3];
 };
-static_assert(sizeof(voxel_record_v1) == 16);
+static_assert(sizeof(voxel_record_gpu) == 16);
 
 #pragma pack(push, 1)
-struct voxel_file_header_v1 {
+struct voxel_file_header_v2 {
     char magic[8];
     uint32_t version;
     uint32_t header_bytes;
@@ -273,10 +273,17 @@ struct voxel_file_header_v1 {
     uint32_t flags;
     uint64_t source_gaussian_count;
     uint64_t payload_bytes;
-    uint64_t reserved[3];
+    uint64_t occupancy_bytes;
+    uint64_t color_bytes;
+    uint64_t reserved;
 };
 #pragma pack(pop)
-static_assert(sizeof(voxel_file_header_v1) == 128);
+static_assert(sizeof(voxel_file_header_v2) == 128);
+
+struct voxel_payload_v2 {
+    std::vector<uint8_t> occupancy;
+    std::vector<uint8_t> colors;
+};
 
 struct push_constants {
     uint32_t gaussian_count;
@@ -909,23 +916,68 @@ void shader_barrier(VkCommandBuffer command) {
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+uint8_t quantize_unorm8(float value) {
+    const float scaled =
+        std::clamp(value, 0.0f, 1.0f) * 255.0f;
+    return uint8_t(std::floor(scaled + 0.5f));
+}
+
+voxel_payload_v2 materialize_voxel_payload(
+    std::vector<voxel_record_gpu> & records,
+    uint32_t voxel_count) {
+    std::sort(
+        records.begin(), records.end(),
+        [](const voxel_record_gpu & left,
+           const voxel_record_gpu & right) {
+            return left.linear_index < right.linear_index;
+        });
+
+    voxel_payload_v2 payload;
+    payload.occupancy.resize(
+        (uint64_t(voxel_count) + 7) / 8, uint8_t(0));
+    payload.colors.resize(records.size() * 3);
+    uint32_t previous = 0;
+    for (size_t index = 0; index < records.size(); ++index) {
+        const voxel_record_gpu & record = records[index];
+        if (record.linear_index >= voxel_count ||
+            !std::isfinite(record.color[0]) ||
+            !std::isfinite(record.color[1]) ||
+            !std::isfinite(record.color[2])) {
+            throw std::runtime_error(
+                "Vulkan produced an invalid voxel record");
+        }
+        if (index > 0 && record.linear_index == previous) {
+            throw std::runtime_error(
+                "Vulkan produced duplicate voxel records");
+        }
+        previous = record.linear_index;
+        payload.occupancy[record.linear_index >> 3] |=
+            uint8_t(1u << (record.linear_index & 7u));
+        for (size_t channel = 0; channel < 3; ++channel) {
+            payload.colors[index * 3 + channel] =
+                quantize_unorm8(record.color[channel]);
+        }
+    }
+    return payload;
+}
+
 void write_voxel_file(
     const voxel_conversion_options & options,
     const std::array<float, 3> & origin,
     float voxel_size, uint64_t gaussian_count,
-    const std::vector<voxel_record_v1> & records) {
-    voxel_file_header_v1 header{};
+    const voxel_payload_v2 & payload) {
+    voxel_file_header_v2 header{};
     const std::array<char, 8> magic{
         'T', 'S', 'V', 'O', 'X', 'E', 'L', '\0'};
     std::copy(magic.begin(), magic.end(), header.magic);
-    header.version = 1;
+    header.version = 2;
     header.header_bytes = sizeof(header);
     header.resolution = options.resolution;
     header.axis_order = 0; // occupancy[z,y,x], x-fastest linear index
-    header.color_type = 1; // RGB float32
-    header.record_bytes = sizeof(voxel_record_v1);
-    header.occupied_count = records.size();
-    header.record_count = records.size();
+    header.color_type = 2; // RGB UNORM8
+    header.record_bytes = 3;
+    header.occupied_count = payload.colors.size() / 3;
+    header.record_count = header.occupied_count;
     std::copy(origin.begin(), origin.end(), header.origin);
     header.voxel_size = voxel_size;
     header.iso = options.iso;
@@ -933,10 +985,14 @@ void write_voxel_file(
     header.tolerance = options.tolerance;
     header.color_weight_power = options.color_weight_power;
     header.integration_steps = options.integration_steps;
-    header.flags = 1u | 2u; // little-endian, unordered sparse records
+    // little-endian header, LSB-first occupancy bitset, RGB entries ordered
+    // by increasing linear voxel index.
+    header.flags = 1u | 2u | 4u;
     header.source_gaussian_count = gaussian_count;
+    header.occupancy_bytes = payload.occupancy.size();
+    header.color_bytes = payload.colors.size();
     header.payload_bytes =
-        uint64_t(records.size()) * sizeof(voxel_record_v1);
+        header.occupancy_bytes + header.color_bytes;
 
     const std::filesystem::path path(options.output_path);
     if (!path.parent_path().empty()) {
@@ -948,10 +1004,15 @@ void write_voxel_file(
             "cannot open voxel output: " + options.output_path);
     }
     stream.write(reinterpret_cast<const char *>(&header), sizeof(header));
-    if (!records.empty()) {
+    if (!payload.occupancy.empty()) {
         stream.write(
-            reinterpret_cast<const char *>(records.data()),
-            std::streamsize(records.size() * sizeof(voxel_record_v1)));
+            reinterpret_cast<const char *>(payload.occupancy.data()),
+            std::streamsize(payload.occupancy.size()));
+    }
+    if (!payload.colors.empty()) {
+        stream.write(
+            reinterpret_cast<const char *>(payload.colors.data()),
+            std::streamsize(payload.colors.size()));
     }
     if (!stream) {
         throw std::runtime_error(
@@ -965,7 +1026,7 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
     const voxel_conversion_options & options) {
     if (!host_is_little_endian()) {
         throw std::runtime_error(
-            "TSVOXEL v1 currently requires a little-endian host");
+            "TSVOXEL v2 currently requires a little-endian host");
     }
     if (options.input_ply.empty() || options.output_path.empty()) {
         throw std::invalid_argument(
@@ -1142,7 +1203,7 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
         uint64_t(voxel_count) * 5 * sizeof(uint32_t),
         storage | transfer_destination, device_memory);
     vk_buffer record_buffer = context.create_buffer(
-        uint64_t(voxel_count) * sizeof(voxel_record_v1),
+        uint64_t(voxel_count) * sizeof(voxel_record_gpu),
         storage | transfer_source, device_memory);
     vk_buffer counter_buffer = context.create_buffer(
         sizeof(uint32_t), storage | transfer_destination,
@@ -1204,32 +1265,25 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
 
     vk_buffer readback_buffer = context.create_buffer(
         uint64_t(std::max(occupied, 1u)) *
-            sizeof(voxel_record_v1),
+            sizeof(voxel_record_gpu),
         transfer_destination, host_memory, coherent);
     if (occupied > 0) {
         context.copy_buffer(
             record_buffer, readback_buffer,
-            uint64_t(occupied) * sizeof(voxel_record_v1));
+            uint64_t(occupied) * sizeof(voxel_record_gpu));
         context.invalidate(readback_buffer);
     }
-    std::vector<voxel_record_v1> records(occupied);
+    std::vector<voxel_record_gpu> records(occupied);
     if (occupied > 0) {
         std::memcpy(records.data(), readback_buffer.mapped,
-                    records.size() * sizeof(voxel_record_v1));
+                    records.size() * sizeof(voxel_record_gpu));
     }
-    for (const voxel_record_v1 & record : records) {
-        if (record.linear_index >= voxel_count ||
-            !std::isfinite(record.color[0]) ||
-            !std::isfinite(record.color[1]) ||
-            !std::isfinite(record.color[2])) {
-            throw std::runtime_error(
-                "Vulkan produced an invalid voxel record");
-        }
-    }
+    const voxel_payload_v2 payload =
+        materialize_voxel_payload(records, voxel_count);
     const auto conversion_end = std::chrono::steady_clock::now();
     write_voxel_file(
         options, origin, voxel_size,
-        gaussians.size(), records);
+        gaussians.size(), payload);
 
     voxel_conversion_result result;
     result.device_name = context.device_name();
@@ -1237,8 +1291,8 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
     result.aabb_candidate_pairs = total_pairs_64;
     result.occupied_voxels = occupied;
     result.output_bytes =
-        sizeof(voxel_file_header_v1) +
-        uint64_t(records.size()) * sizeof(voxel_record_v1);
+        sizeof(voxel_file_header_v2) +
+        payload.occupancy.size() + payload.colors.size();
     result.converter_gpu_bytes = context.peak_bytes();
     result.setup_milliseconds =
         std::chrono::duration<double, std::milli>(

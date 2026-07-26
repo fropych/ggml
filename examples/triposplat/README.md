@@ -103,10 +103,12 @@ The defaults reproduce the selected Python/Kaolin reference configuration:
 voxel axis, and color-weight power `0.625`. The grid resolution must be a
 power of two. Use `--device N` to select the raw Vulkan physical-device index.
 
-The output is a small, dependency-free sparse binary rather than an NPZ
-archive. Its exact 128-byte header, 16-byte RGB record, index order, grid fit,
-and minimal C++ declarations are specified in
-[VOXEL_FORMAT.md](VOXEL_FORMAT.md).
+The output is a small, dependency-free binary rather than an NPZ archive.
+TSVOXEL v2 stores one occupancy bit per dense voxel followed by one three-byte
+RGB8 value per set bit. GPU output is sorted by `linear_index` on CPU before
+the bitset and ordered color stream are materialized. Its exact 128-byte
+header, bit order, quantization rule, grid fit, and minimal C++ declaration
+are specified in [VOXEL_FORMAT.md](VOXEL_FORMAT.md).
 
 For development, compare a result against the Python reference contract with:
 
@@ -117,9 +119,10 @@ For development, compare a result against the Python reference contract with:
   ../output/voxel_joint_64/best_64.npz
 ```
 
-The test validates the complete file structure, exact occupancy, origin and
-voxel size, conversion parameters, and RGB error bounds. NumPy is a test-only
-dependency and is not used or linked by the converter.
+The test validates the complete v2 file structure, bitset padding and
+population, exact occupancy, origin and voxel size, conversion parameters,
+RGB8 bytes against a quantized Python reference, and decoded RGB error bounds.
+NumPy is a test-only dependency and is not used or linked by the converter.
 
 Reference measurements for `output/result.ply` on an NVIDIA A100-SXM4-40GB
 are below. Times are medians of seven runs. `conversion` excludes output-file
@@ -130,9 +133,19 @@ readback buffers.
 
 | Grid | Python conversion | Vulkan conversion | Vulkan/Python | Vulkan GPU | Vulkan allocations | Python max allocated | Memory ratio |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 32³ | 12.497 ms | 11.858 ms | 0.949x | 1.568 ms | 8.62 MiB | 51.05 MiB | 0.169x |
-| 64³ | 26.063 ms | 18.628 ms | 0.715x | 3.804 ms | 17.19 MiB | 122.04 MiB | 0.141x |
-| 128³ | 111.062 ms | 116.154 ms | 1.046x | 18.945 ms | 85.51 MiB | 498.12 MiB | 0.172x |
+| 32³ | 12.497 ms | 12.956 ms | 1.037x | 1.598 ms | 8.62 MiB | 51.05 MiB | 0.169x |
+| 64³ | 26.063 ms | 22.150 ms | 0.850x | 3.835 ms | 17.19 MiB | 122.04 MiB | 0.141x |
+| 128³ | 111.062 ms | 100.463 ms | 0.905x | 19.105 ms | 85.51 MiB | 498.12 MiB | 0.172x |
+
+CPU sorting, bitset construction, and RGB8 quantization are included in the
+Vulkan `conversion` time. The `Vulkan GPU` column contains only timestamped
+GPU work.
+
+| Grid | TSVOXEL v2 | Python NPZ | v2 reduction vs NPZ |
+|---:|---:|---:|---:|
+| 32³ | 27,624 bytes | 92,951 bytes | 70.3% |
+| 64³ | 193,348 bytes | 620,796 bytes | 68.9% |
+| 128³ | 1,468,248 bytes | 4,564,827 bytes | 67.8% |
 
 The one-time Vulkan setup was approximately 270–290 ms on this driver and is
 printed separately by the CLI. A long-lived caller can reuse a converter
