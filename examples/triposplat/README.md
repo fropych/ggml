@@ -101,7 +101,15 @@ Vulkan GPU. It does not run the neural network and does not create a mesh:
 The defaults reproduce the selected Python/Kaolin reference configuration:
 `iso=11.345`, occupancy threshold `0.10`, tolerance `0.125`, 10 samples per
 voxel axis, and color-weight power `0.625`. The grid resolution must be a
-power of two. Use `--device N` to select the raw Vulkan physical-device index.
+power of two in `[2, 1024]`. Use `--device N` to select the raw Vulkan
+physical-device index.
+
+Large grids are processed as consecutive Z chunks. The converter caps a chunk
+at 33,554,432 voxels and reduces it further when required by the device's
+`maxStorageBufferRange`. Only the current chunk has dense accumulation and
+record buffers; the global output remains a compact CPU occupancy bitset plus
+RGB8 stream. `--chunk-depth N` can impose a smaller Z depth for testing or
+memory tuning; zero/default selects the automatic depth.
 
 The output is a small, dependency-free binary rather than an NPZ archive.
 TSVOXEL v2 stores one occupancy bit per dense voxel followed by one three-byte
@@ -122,6 +130,12 @@ For development, compare a result against the Python reference contract with:
 The test validates the complete v2 file structure, bitset padding and
 population, exact occupancy, origin and voxel size, conversion parameters,
 RGB8 bytes against a quantized Python reference, and decoded RGB error bounds.
+Pass `--baseline-tsvoxel FILE` to additionally require exact baseline
+occupancy and bounded RGB8 differences. This is the regression contract used
+to compare chunked and monolithic Vulkan output. For very large files without
+a reference, `--structure-only` validates the header, sizes, padding, and
+occupancy population as a streaming pass without materializing a dense NumPy
+grid.
 NumPy is a test-only dependency and is not used or linked by the converter.
 
 Reference measurements for `output/result.ply` on an NVIDIA A100-SXM4-40GB
@@ -140,6 +154,14 @@ readback buffers.
 CPU sorting, bitset construction, and RGB8 quantization are included in the
 Vulkan `conversion` time. The `Vulkan GPU` column contains only timestamped
 GPU work.
+
+The memory-chunked implementation was also benchmarked directly against the
+monolithic implementation through 1024³. At 512³ it reduces peak Vulkan
+allocations from 4,998.75 MiB to 1,314.84 MiB with effectively unchanged
+conversion time. At 1024³ it uses 1,365.05 MiB total / 1,157.13 MiB
+device-local; the old implementation fails. Full methodology, timings, memory
+figures, and parity results are in
+[VOXEL_CHUNKING_BENCHMARK.md](VOXEL_CHUNKING_BENCHMARK.md).
 
 | Grid | TSVOXEL v2 | Python NPZ | v2 reduction vs NPZ |
 |---:|---:|---:|---:|

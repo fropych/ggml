@@ -37,6 +37,10 @@ layout(push_constant) uniform PushConstants {
     float tolerance;
     float color_weight_power;
     float opacity_threshold;
+    uint chunk_z_begin;
+    uint chunk_z_count;
+    uint work_item_base;
+    uint reserved;
 } pc;
 
 bool aabb_inside_voxel(vec3 aabb_min, vec3 aabb_max, vec3 voxel,
@@ -169,7 +173,8 @@ void atomic_composite_alpha(uint index, float value) {
 }
 
 void main() {
-    const uint pair_index = gl_GlobalInvocationID.x;
+    const uint pair_index =
+        pc.work_item_base + gl_GlobalInvocationID.x;
     if (pair_index >= pc.total_pairs) {
         return;
     }
@@ -243,10 +248,10 @@ void main() {
         pow(max(alpha, 1e-12), pc.color_weight_power);
     const vec3 color =
         vec3(g.cov1_color.z, g.cov1_color.w, g.aabb_min_color.w);
-    const uint linear =
+    const uint local_linear =
         cell.x + pc.resolution *
-        (cell.y + pc.resolution * cell.z);
-    const uint base = linear * 5;
+        (cell.y + pc.resolution * (cell.z - pc.chunk_z_begin));
+    const uint base = local_linear * 5;
     atomic_composite_alpha(base, alpha);
     atomic_add_float(base + 1, weight);
     atomic_add_float(base + 2, weight * color.r);

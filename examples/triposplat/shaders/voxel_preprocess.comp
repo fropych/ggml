@@ -43,10 +43,14 @@ layout(push_constant) uniform PushConstants {
     float tolerance;
     float color_weight_power;
     float opacity_threshold;
+    uint chunk_z_begin;
+    uint chunk_z_count;
+    uint work_item_base;
+    uint reserved;
 } pc;
 
 void main() {
-    const uint index = gl_GlobalInvocationID.x;
+    const uint index = pc.work_item_base + gl_GlobalInvocationID.x;
     if (index >= pc.gaussian_count) {
         return;
     }
@@ -123,8 +127,15 @@ void main() {
                       ivec3(0), ivec3(int(pc.resolution) - 1));
         upper = clamp(ivec3(floor((aabb_max + vec3(1.0)) / voxel_size)),
                       ivec3(0), ivec3(int(pc.resolution) - 1));
-        const uvec3 dimensions = uvec3(upper - lower + ivec3(1));
-        count = dimensions.x * dimensions.y * dimensions.z;
+        const int chunk_lower = int(pc.chunk_z_begin);
+        const int chunk_upper =
+            int(pc.chunk_z_begin + pc.chunk_z_count - 1);
+        lower.z = max(lower.z, chunk_lower);
+        upper.z = min(upper.z, chunk_upper);
+        if (lower.z <= upper.z) {
+            const uvec3 dimensions = uvec3(upper - lower + ivec3(1));
+            count = dimensions.x * dimensions.y * dimensions.z;
+        }
     }
     prepared.bounds_lo_count = uvec4(uvec3(lower), count);
     prepared.bounds_hi = uvec4(uvec3(upper), 0);

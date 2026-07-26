@@ -15,6 +15,7 @@ struct voxel_conversion_options {
     float tolerance = 0.125f;
     uint32_t integration_steps = 10;
     float color_weight_power = 0.625f;
+    uint32_t chunk_depth = 0;
     int vulkan_device = 0;
 };
 
@@ -25,6 +26,9 @@ struct voxel_conversion_result {
     uint64_t occupied_voxels = 0;
     uint64_t output_bytes = 0;
     uint64_t converter_gpu_bytes = 0;
+    uint64_t converter_device_bytes = 0;
+    uint32_t chunk_count = 0;
+    uint32_t max_chunk_voxels = 0;
     double setup_milliseconds = 0.0;
     double conversion_milliseconds = 0.0;
     double gpu_milliseconds = 0.0;

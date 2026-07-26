@@ -56,6 +56,7 @@ static void usage(const char * argv0) {
         "  --iso F                Gaussian isocontour (default: 11.345)\n"
         "  --tolerance F          Minimum relative Gaussian scale (default: 0.125)\n"
         "  --integration-steps N  Samples per voxel axis, 1..256 (default: 10)\n"
+        "  --chunk-depth N        Z layers per GPU chunk (default: automatic)\n"
         "  --device N             Vulkan device index (default: 0)\n\n"
         "  %s --inspect MODEL.safetensors\n"
         "  %s --load MODEL.safetensors [--f16]\n\n"
@@ -95,6 +96,32 @@ static uint32_t uint32_option(
             std::string("invalid uint32 value for ") + option);
     }
     return uint32_t(parsed);
+}
+
+static float float_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const float parsed = std::stof(value, &consumed);
+    if (consumed != value.size() || !std::isfinite(parsed)) {
+        throw std::invalid_argument(
+            std::string("invalid finite float value for ") + option);
+    }
+    return parsed;
+}
+
+static int int_option(
+    int & index, int argc, char ** argv, const char * option) {
+    const std::string value = option_value(index, argc, argv);
+    size_t consumed = 0;
+    const long long parsed = std::stoll(value, &consumed);
+    if (consumed != value.size() ||
+        parsed < std::numeric_limits<int>::min() ||
+        parsed > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument(
+            std::string("invalid int value for ") + option);
+    }
+    return int(parsed);
 }
 
 static std::filesystem::path executable_directory(const char * argv0) {
@@ -151,22 +178,25 @@ static int run_cli_command(int argc, char ** argv) {
                     uint32_option(i, argc, argv, "--resolution");
             } else if (option == "--opacity-threshold") {
                 options.opacity_threshold =
-                    std::stof(option_value(i, argc, argv));
+                    float_option(i, argc, argv, "--opacity-threshold");
             } else if (option == "--color-weight-power") {
                 options.color_weight_power =
-                    std::stof(option_value(i, argc, argv));
+                    float_option(i, argc, argv, "--color-weight-power");
             } else if (option == "--iso") {
                 options.iso =
-                    std::stof(option_value(i, argc, argv));
+                    float_option(i, argc, argv, "--iso");
             } else if (option == "--tolerance") {
                 options.tolerance =
-                    std::stof(option_value(i, argc, argv));
+                    float_option(i, argc, argv, "--tolerance");
             } else if (option == "--integration-steps") {
                 options.integration_steps =
                     uint32_option(i, argc, argv, "--integration-steps");
+            } else if (option == "--chunk-depth") {
+                options.chunk_depth =
+                    uint32_option(i, argc, argv, "--chunk-depth");
             } else if (option == "--device") {
                 options.vulkan_device =
-                    std::stoi(option_value(i, argc, argv));
+                    int_option(i, argc, argv, "--device");
             } else {
                 throw std::invalid_argument(
                     "unknown voxelize option: " + option);
@@ -183,7 +213,9 @@ static int run_cli_command(int argc, char ** argv) {
             "Gaussian voxelization: %.3f ms GPU, %.3f ms conversion, "
             "%.3f ms setup\n"
             "Gaussians: %llu, AABB candidates: %llu, occupied: %llu\n"
-            "Converter allocations: %.2f MiB\n"
+            "Chunks: %u, largest: %u voxels\n"
+            "Peak Vulkan allocations: %.2f MiB total, "
+            "%.2f MiB device-local\n"
             "%s (%llu bytes)\n",
             result.device_name.c_str(),
             result.gpu_milliseconds,
@@ -192,7 +224,10 @@ static int run_cli_command(int argc, char ** argv) {
             static_cast<unsigned long long>(result.gaussian_count),
             static_cast<unsigned long long>(result.aabb_candidate_pairs),
             static_cast<unsigned long long>(result.occupied_voxels),
+            result.chunk_count,
+            result.max_chunk_voxels,
             double(result.converter_gpu_bytes) / (1024.0 * 1024.0),
+            double(result.converter_device_bytes) / (1024.0 * 1024.0),
             options.output_path.c_str(),
             static_cast<unsigned long long>(result.output_bytes));
         return 0;

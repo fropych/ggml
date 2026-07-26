@@ -23,12 +23,17 @@ layout(push_constant) uniform PushConstants {
     float tolerance;
     float color_weight_power;
     float opacity_threshold;
+    uint chunk_z_begin;
+    uint chunk_z_count;
+    uint work_item_base;
+    uint reserved;
 } pc;
 
 void main() {
-    const uint index = gl_GlobalInvocationID.x;
+    const uint index =
+        pc.work_item_base + gl_GlobalInvocationID.x;
     const uint voxel_count =
-        pc.resolution * pc.resolution * pc.resolution;
+        pc.resolution * pc.resolution * pc.chunk_z_count;
     if (index >= voxel_count) {
         return;
     }
@@ -45,7 +50,9 @@ void main() {
              uintBitsToFloat(accumulation.values[base + 4])) / weight,
         vec3(0.0), vec3(1.0));
     const uint output_index = atomicAdd(counter.value, 1);
+    const uint global_index =
+        index + pc.chunk_z_begin * pc.resolution * pc.resolution;
     records.values[output_index] =
-        uvec4(index, floatBitsToUint(color.r),
+        uvec4(global_index, floatBitsToUint(color.r),
               floatBitsToUint(color.g), floatBitsToUint(color.b));
 }

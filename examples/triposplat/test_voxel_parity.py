@@ -34,6 +34,106 @@ class VoxelFile:
     colors_rgb8: np.ndarray
 
 
+def validate_structure_streaming(path: Path) -> None:
+    file_size = path.stat().st_size
+    with path.open("rb") as stream:
+        header = stream.read(HEADER.size)
+        if len(header) != HEADER.size:
+            raise ValueError(f"{path}: truncated header")
+        fields = HEADER.unpack(header)
+        (
+            magic,
+            version,
+            header_bytes,
+            resolution,
+            axis_order,
+            color_type,
+            record_bytes,
+            occupied_count,
+            record_count,
+            _origin_x,
+            _origin_y,
+            _origin_z,
+            _voxel_size,
+            _iso,
+            _opacity_threshold,
+            _tolerance,
+            _color_weight_power,
+            _integration_steps,
+            flags,
+            _source_gaussian_count,
+            payload_bytes,
+            occupancy_bytes,
+            color_bytes,
+            reserved,
+        ) = fields
+        if magic != b"TSVOXEL\0":
+            raise ValueError(f"{path}: invalid magic {magic!r}")
+        if version != 2 or header_bytes < HEADER.size:
+            raise ValueError(
+                f"{path}: unsupported version/header "
+                f"{version}/{header_bytes}"
+            )
+        if resolution < 2 or resolution & (resolution - 1):
+            raise ValueError(
+                f"{path}: resolution is not a power of two"
+            )
+        if axis_order != 0 or color_type != 2 or record_bytes != 3:
+            raise ValueError(
+                f"{path}: unsupported axis/color encoding"
+            )
+        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS:
+            raise ValueError(f"{path}: required v2 flags are missing")
+        if occupied_count != record_count:
+            raise ValueError(
+                f"{path}: occupied_count != record_count"
+            )
+        voxel_count = resolution**3
+        expected_occupancy_bytes = (voxel_count + 7) // 8
+        if occupancy_bytes != expected_occupancy_bytes:
+            raise ValueError(
+                f"{path}: occupancy bytes {occupancy_bytes} "
+                f"!= {expected_occupancy_bytes}"
+            )
+        if color_bytes != record_count * record_bytes:
+            raise ValueError(f"{path}: inconsistent color byte count")
+        if payload_bytes != occupancy_bytes + color_bytes:
+            raise ValueError(f"{path}: inconsistent payload size")
+        if file_size != header_bytes + payload_bytes:
+            raise ValueError(
+                f"{path}: file size {file_size} "
+                f"!= {header_bytes + payload_bytes}"
+            )
+        if reserved:
+            raise ValueError(f"{path}: non-zero v2 reserved field")
+
+        stream.seek(header_bytes)
+        population = 0
+        remaining = occupancy_bytes
+        last_byte = 0
+        while remaining:
+            block = stream.read(min(8 * 1024 * 1024, remaining))
+            if not block:
+                raise ValueError(f"{path}: truncated occupancy bitset")
+            population += sum(value.bit_count() for value in block)
+            last_byte = block[-1]
+            remaining -= len(block)
+        trailing_bits = voxel_count & 7
+        if trailing_bits and last_byte & ~((1 << trailing_bits) - 1):
+            raise ValueError(
+                f"{path}: non-zero occupancy padding bits"
+            )
+        if population != occupied_count:
+            raise ValueError(
+                f"{path}: bitset contains {population} occupied "
+                f"voxels, header says {occupied_count}"
+            )
+    print(
+        f"N={resolution}: streaming structure valid, "
+        f"occupied={occupied_count}, bytes={file_size}"
+    )
+
+
 def load_tsvoxel(path: Path) -> VoxelFile:
     data = path.read_bytes()
     if len(data) < HEADER.size:
@@ -162,6 +262,65 @@ def quantize_rgb8(colors: np.ndarray) -> np.ndarray:
     return np.floor(scaled).astype(np.uint8)
 
 
+def compare_tsvoxel(
+    actual: VoxelFile,
+    baseline: VoxelFile,
+    max_rgb8_mismatch_rate: float,
+    max_rgb8_byte_error: int,
+) -> None:
+    scalar_fields = (
+        "resolution",
+        "occupied_count",
+        "voxel_size",
+        "iso",
+        "opacity_threshold",
+        "tolerance",
+        "color_weight_power",
+        "integration_steps",
+        "source_gaussian_count",
+    )
+    for field in scalar_fields:
+        if getattr(actual, field) != getattr(baseline, field):
+            raise AssertionError(
+                f"baseline {field}: {getattr(actual, field)!r} "
+                f"!= {getattr(baseline, field)!r}"
+            )
+    if not np.array_equal(actual.origin, baseline.origin):
+        raise AssertionError("baseline origin differs")
+    if not np.array_equal(actual.occupancy, baseline.occupancy):
+        xor_count = int(np.count_nonzero(
+            actual.occupancy ^ baseline.occupancy
+        ))
+        raise AssertionError(
+            f"baseline occupancy differs at {xor_count} voxels"
+        )
+
+    byte_error = np.abs(
+        actual.colors_rgb8[actual.occupancy].astype(np.int16)
+        - baseline.colors_rgb8[baseline.occupancy].astype(np.int16)
+    )
+    mismatch_count = int(np.count_nonzero(byte_error))
+    mismatch_rate = (
+        mismatch_count / byte_error.size if byte_error.size else 0.0
+    )
+    maximum_byte_error = int(byte_error.max()) if byte_error.size else 0
+    print(
+        f"baseline TSVOX: occupancy exact, RGB8 mismatches="
+        f"{mismatch_count}/{byte_error.size} ({mismatch_rate:.9g}), "
+        f"byte max={maximum_byte_error}"
+    )
+    if mismatch_rate > max_rgb8_mismatch_rate:
+        raise AssertionError(
+            f"baseline RGB8 mismatch rate {mismatch_rate:.9g} "
+            f"> {max_rgb8_mismatch_rate:.9g}"
+        )
+    if maximum_byte_error > max_rgb8_byte_error:
+        raise AssertionError(
+            f"baseline RGB8 max byte error {maximum_byte_error} "
+            f"> {max_rgb8_byte_error}"
+        )
+
+
 def compare(
     actual: VoxelFile,
     reference_path: Path,
@@ -275,22 +434,63 @@ def compare(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tsvoxel", type=Path)
-    parser.add_argument("reference_npz", type=Path)
+    parser.add_argument(
+        "reference_npz",
+        type=Path,
+        nargs="?",
+        help="optional Python/Kaolin NPZ reference",
+    )
+    parser.add_argument(
+        "--baseline-tsvoxel",
+        type=Path,
+        help="compare exact occupancy and bounded RGB8 with a baseline TSVOXEL",
+    )
     parser.add_argument("--max-rgb8-mismatch-rate", type=float, default=5e-4)
     parser.add_argument("--max-rgb8-byte-error", type=int, default=1)
     parser.add_argument("--max-color-mae", type=float, default=1.05e-3)
     parser.add_argument("--max-color-error", type=float, default=2.1e-3)
+    parser.add_argument(
+        "--structure-only",
+        action="store_true",
+        help="stream-validate the file without dense NumPy materialization",
+    )
     args = parser.parse_args()
-    try:
-        actual = load_tsvoxel(args.tsvoxel)
-        compare(
-            actual,
-            args.reference_npz,
-            args.max_rgb8_mismatch_rate,
-            args.max_rgb8_byte_error,
-            args.max_color_mae,
-            args.max_color_error,
+    if (
+        not args.structure_only
+        and args.reference_npz is None
+        and args.baseline_tsvoxel is None
+    ):
+        parser.error(
+            "provide reference_npz, --baseline-tsvoxel, "
+            "and/or --structure-only"
         )
+    try:
+        if args.structure_only:
+            validate_structure_streaming(args.tsvoxel)
+            if (
+                args.reference_npz is None
+                and args.baseline_tsvoxel is None
+            ):
+                print("PASS")
+                return 0
+        actual = load_tsvoxel(args.tsvoxel)
+        if args.baseline_tsvoxel is not None:
+            baseline = load_tsvoxel(args.baseline_tsvoxel)
+            compare_tsvoxel(
+                actual,
+                baseline,
+                args.max_rgb8_mismatch_rate,
+                args.max_rgb8_byte_error,
+            )
+        if args.reference_npz is not None:
+            compare(
+                actual,
+                args.reference_npz,
+                args.max_rgb8_mismatch_rate,
+                args.max_rgb8_byte_error,
+                args.max_color_mae,
+                args.max_color_error,
+            )
     except (AssertionError, OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1

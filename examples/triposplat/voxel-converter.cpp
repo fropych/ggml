@@ -25,6 +25,8 @@ namespace {
 
 constexpr float kShC0 = 0.28209479177387814f;
 constexpr uint32_t kLocalSize = 256;
+constexpr uint64_t kTargetChunkVoxels = 32ull * 1024 * 1024;
+constexpr uint32_t kMaximumResolution = 1024;
 
 void vk_require(VkResult result, const char * operation) {
     if (result != VK_SUCCESS) {
@@ -294,8 +296,12 @@ struct push_constants {
     float tolerance;
     float color_weight_power;
     float opacity_threshold;
+    uint32_t chunk_z_begin;
+    uint32_t chunk_z_count;
+    uint32_t work_item_base;
+    uint32_t reserved;
 };
-static_assert(sizeof(push_constants) == 32);
+static_assert(sizeof(push_constants) == 48);
 
 class vulkan_context;
 
@@ -308,6 +314,7 @@ struct vk_buffer {
     void * mapped = nullptr;
     bool coherent = false;
     uint64_t * current_bytes = nullptr;
+    uint64_t * current_device_bytes = nullptr;
 
     vk_buffer() = default;
     vk_buffer(const vk_buffer &) = delete;
@@ -327,6 +334,8 @@ struct vk_buffer {
         mapped = std::exchange(other.mapped, nullptr);
         coherent = other.coherent;
         current_bytes = std::exchange(other.current_bytes, nullptr);
+        current_device_bytes =
+            std::exchange(other.current_device_bytes, nullptr);
         return *this;
     }
     ~vk_buffer() {
@@ -339,6 +348,9 @@ struct vk_buffer {
         if (buffer) vkDestroyBuffer(device, buffer, nullptr);
         if (memory) vkFreeMemory(device, memory, nullptr);
         if (current_bytes) *current_bytes -= uint64_t(allocation_size);
+        if (current_device_bytes) {
+            *current_device_bytes -= uint64_t(allocation_size);
+        }
         device = VK_NULL_HANDLE;
         buffer = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
@@ -346,6 +358,7 @@ struct vk_buffer {
         size = 0;
         allocation_size = 0;
         current_bytes = nullptr;
+        current_device_bytes = nullptr;
     }
 };
 
@@ -597,6 +610,12 @@ public:
     uint64_t peak_bytes() const {
         return peak_bytes_;
     }
+    uint64_t peak_device_bytes() const {
+        return peak_device_bytes_;
+    }
+    uint64_t max_storage_buffer_range() const {
+        return properties_.limits.maxStorageBufferRange;
+    }
 
     vk_buffer create_buffer(
         VkDeviceSize size, VkBufferUsageFlags usage,
@@ -641,6 +660,9 @@ public:
         result.allocation_size = requirements.size;
         const VkMemoryPropertyFlags flags =
             memory_properties_.memoryTypes[memory_type].propertyFlags;
+        if (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            result.current_device_bytes = &current_device_bytes_;
+        }
         result.coherent =
             (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
         if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -651,6 +673,11 @@ public:
         }
         current_bytes_ += uint64_t(requirements.size);
         peak_bytes_ = std::max(peak_bytes_, current_bytes_);
+        if (result.current_device_bytes) {
+            current_device_bytes_ += uint64_t(requirements.size);
+            peak_device_bytes_ =
+                std::max(peak_device_bytes_, current_device_bytes_);
+        }
         return result;
     }
 
@@ -683,6 +710,11 @@ public:
     }
 
     void update_binding(uint32_t binding, const vk_buffer & buffer) {
+        if (buffer.size > properties_.limits.maxStorageBufferRange) {
+            throw std::runtime_error(
+                "storage buffer descriptor exceeds "
+                "maxStorageBufferRange");
+        }
         const VkDescriptorBufferInfo buffer_info{
             buffer.buffer, 0, buffer.size};
         const VkWriteDescriptorSet write{
@@ -873,33 +905,38 @@ private:
     VkQueryPool query_pool_ = VK_NULL_HANDLE;
     uint64_t current_bytes_ = 0;
     uint64_t peak_bytes_ = 0;
+    uint64_t current_device_bytes_ = 0;
+    uint64_t peak_device_bytes_ = 0;
 };
 
-uint32_t dispatch_groups(uint64_t work_items,
-                         const vulkan_context & context) {
-    const uint64_t groups =
-        (work_items + kLocalSize - 1) / kLocalSize;
-    if (groups > context.max_dispatch_x()) {
-        throw std::overflow_error(
-            "Vulkan dispatch exceeds maxComputeWorkGroupCount.x");
-    }
-    return uint32_t(groups);
-}
-
-void bind_compute(VkCommandBuffer command,
-                  const vulkan_context & context,
-                  VkPipeline pipeline,
-                  const push_constants & constants) {
+void dispatch_compute(VkCommandBuffer command,
+                      const vulkan_context & context,
+                      VkPipeline pipeline,
+                      push_constants constants,
+                      uint32_t work_items) {
+    if (work_items == 0) return;
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline);
     const VkDescriptorSet set = context.descriptor_set();
     vkCmdBindDescriptorSets(
         command, VK_PIPELINE_BIND_POINT_COMPUTE,
         context.pipeline_layout(), 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(
-        command, context.pipeline_layout(),
-        VK_SHADER_STAGE_COMPUTE_BIT, 0,
-        sizeof(constants), &constants);
+    const uint64_t maximum_items =
+        uint64_t(context.max_dispatch_x()) * kLocalSize;
+    uint64_t base = 0;
+    while (base < work_items) {
+        const uint64_t count =
+            std::min<uint64_t>(work_items - base, maximum_items);
+        constants.work_item_base = uint32_t(base);
+        vkCmdPushConstants(
+            command, context.pipeline_layout(),
+            VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            sizeof(constants), &constants);
+        const uint32_t groups = uint32_t(
+            (count + kLocalSize - 1) / kLocalSize);
+        vkCmdDispatch(command, groups, 1, 1);
+        base += count;
+    }
 }
 
 void shader_barrier(VkCommandBuffer command) {
@@ -922,9 +959,10 @@ uint8_t quantize_unorm8(float value) {
     return uint8_t(std::floor(scaled + 0.5f));
 }
 
-voxel_payload_v2 materialize_voxel_payload(
+void append_voxel_payload(
     std::vector<voxel_record_gpu> & records,
-    uint32_t voxel_count) {
+    uint32_t voxel_count,
+    voxel_payload_v2 & payload) {
     std::sort(
         records.begin(), records.end(),
         [](const voxel_record_gpu & left,
@@ -932,10 +970,12 @@ voxel_payload_v2 materialize_voxel_payload(
             return left.linear_index < right.linear_index;
         });
 
-    voxel_payload_v2 payload;
-    payload.occupancy.resize(
-        (uint64_t(voxel_count) + 7) / 8, uint8_t(0));
-    payload.colors.resize(records.size() * 3);
+    const size_t color_begin = payload.colors.size();
+    if (records.size() >
+        (std::numeric_limits<size_t>::max() - color_begin) / 3) {
+        throw std::overflow_error("voxel color payload is too large");
+    }
+    payload.colors.resize(color_begin + records.size() * 3);
     uint32_t previous = 0;
     for (size_t index = 0; index < records.size(); ++index) {
         const voxel_record_gpu & record = records[index];
@@ -951,14 +991,20 @@ voxel_payload_v2 materialize_voxel_payload(
                 "Vulkan produced duplicate voxel records");
         }
         previous = record.linear_index;
-        payload.occupancy[record.linear_index >> 3] |=
+        const uint8_t occupancy_mask =
             uint8_t(1u << (record.linear_index & 7u));
+        uint8_t & occupancy_byte =
+            payload.occupancy[record.linear_index >> 3];
+        if (occupancy_byte & occupancy_mask) {
+            throw std::runtime_error(
+                "Vulkan produced duplicate voxel records across chunks");
+        }
+        occupancy_byte |= occupancy_mask;
         for (size_t channel = 0; channel < 3; ++channel) {
-            payload.colors[index * 3 + channel] =
+            payload.colors[color_begin + index * 3 + channel] =
                 quantize_unorm8(record.color[channel]);
         }
     }
-    return payload;
 }
 
 void write_voxel_file(
@@ -1033,20 +1079,30 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
             "voxel conversion requires input and output paths");
     }
     if (options.resolution < 2 ||
+        options.resolution > kMaximumResolution ||
         (options.resolution & (options.resolution - 1)) != 0) {
         throw std::invalid_argument(
-            "voxel resolution must be a power of two");
+            "voxel resolution must be a power of two in [2, 1024]");
     }
-    if (!(options.iso > 0.0f) ||
+    if (!std::isfinite(options.iso) ||
+        !std::isfinite(options.opacity_threshold) ||
+        !std::isfinite(options.tolerance) ||
+        !std::isfinite(options.color_weight_power) ||
+        !(options.iso > 0.0f) ||
         !(options.opacity_threshold >= 0.0f &&
           options.opacity_threshold <= 1.0f) ||
         !(options.tolerance > 0.0f) ||
         options.integration_steps == 0 ||
         options.integration_steps > 256 ||
-        !(options.color_weight_power > 0.0f)) {
+        !(options.color_weight_power > 0.0f) ||
+        options.chunk_depth > options.resolution) {
         throw std::invalid_argument(
             "invalid voxel conversion parameters");
     }
+    const uint64_t voxel_count_64 =
+        uint64_t(options.resolution) *
+        options.resolution * options.resolution;
+    const uint32_t voxel_count = uint32_t(voxel_count_64);
 
     const std::vector<gaussian_cpu> gaussians =
         load_gaussian_ply(options.input_ply);
@@ -1140,9 +1196,51 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
     vk_buffer count_buffer = context.create_buffer(
         raw.size() * sizeof(uint32_t), storage,
         host_memory, coherent);
+    std::vector<uint32_t> offsets(raw.size() + 1, 0);
+    vk_buffer offset_staging = context.create_buffer(
+        offsets.size() * sizeof(uint32_t), transfer_source,
+        host_memory, coherent);
+    vk_buffer offset_buffer = context.create_buffer(
+        offsets.size() * sizeof(uint32_t),
+        storage | transfer_destination, device_memory);
+
+    const uint64_t plane_voxels =
+        uint64_t(options.resolution) * options.resolution;
+    const uint64_t descriptor_limit =
+        context.max_storage_buffer_range();
+    const uint64_t descriptor_chunk_voxels = std::min(
+        descriptor_limit / (5 * sizeof(uint32_t)),
+        descriptor_limit / sizeof(voxel_record_gpu));
+    const uint64_t maximum_chunk_voxels = std::min(
+        kTargetChunkVoxels, descriptor_chunk_voxels);
+    if (maximum_chunk_voxels < plane_voxels) {
+        throw std::runtime_error(
+            "maxStorageBufferRange cannot hold one voxel Z plane");
+    }
+    uint32_t maximum_chunk_z = uint32_t(std::min<uint64_t>(
+        options.resolution, maximum_chunk_voxels / plane_voxels));
+    if (options.chunk_depth > 0) {
+        maximum_chunk_z = std::min(
+            maximum_chunk_z, options.chunk_depth);
+    }
+    const uint32_t allocated_chunk_voxels = uint32_t(
+        plane_voxels * maximum_chunk_z);
+
+    vk_buffer accumulation_buffer = context.create_buffer(
+        uint64_t(allocated_chunk_voxels) * 5 * sizeof(uint32_t),
+        storage | transfer_destination, device_memory);
+    vk_buffer record_buffer = context.create_buffer(
+        uint64_t(allocated_chunk_voxels) * sizeof(voxel_record_gpu),
+        storage | transfer_source, device_memory);
+    vk_buffer counter_buffer = context.create_buffer(
+        sizeof(uint32_t), storage | transfer_destination,
+        host_memory, coherent);
+
     context.update_binding(0, raw_buffer);
     context.update_binding(1, prepared_buffer);
-    context.update_binding(2, count_buffer);
+    context.update_binding(3, accumulation_buffer);
+    context.update_binding(4, record_buffer);
+    context.update_binding(5, counter_buffer);
 
     push_constants constants{
         uint32_t(raw.size()),
@@ -1153,133 +1251,167 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
         options.tolerance,
         options.color_weight_power,
         options.opacity_threshold,
+        0,
+        maximum_chunk_z,
+        0,
+        0,
     };
-    VkCommandBuffer preprocess = context.begin_commands();
-    context.begin_timestamp(preprocess, 0);
-    bind_compute(preprocess, context,
-                 context.preprocess_pipeline(), constants);
-    vkCmdDispatch(preprocess,
-                  dispatch_groups(raw.size(), context), 1, 1);
-    context.end_timestamp(preprocess, 0);
-    context.submit_and_wait(preprocess);
-    context.invalidate(count_buffer);
 
-    const uint32_t * counts =
-        static_cast<const uint32_t *>(count_buffer.mapped);
-    std::vector<uint32_t> offsets(raw.size() + 1, 0);
+    voxel_payload_v2 payload;
+    payload.occupancy.resize(
+        (voxel_count_64 + 7) / 8, uint8_t(0));
     uint64_t total_pairs_64 = 0;
-    for (size_t index = 0; index < raw.size(); ++index) {
-        total_pairs_64 += counts[index];
-        if (total_pairs_64 >
-            std::numeric_limits<uint32_t>::max()) {
-            throw std::overflow_error(
-                "Gaussian AABB pair count exceeds uint32");
+    uint64_t occupied_total = 0;
+    uint32_t chunk_count = 0;
+    uint32_t largest_chunk_voxels = 0;
+    double gpu_milliseconds = 0.0;
+
+    uint32_t chunk_z_begin = 0;
+    while (chunk_z_begin < options.resolution) {
+        uint32_t chunk_z_count = std::min(
+            maximum_chunk_z,
+            options.resolution - chunk_z_begin);
+        uint64_t chunk_pairs_64 = 0;
+
+        for (;;) {
+            constants.chunk_z_begin = chunk_z_begin;
+            constants.chunk_z_count = chunk_z_count;
+            constants.total_pairs = 0;
+            context.update_binding(2, count_buffer);
+
+            VkCommandBuffer preprocess = context.begin_commands();
+            context.begin_timestamp(preprocess, 0);
+            dispatch_compute(
+                preprocess, context, context.preprocess_pipeline(),
+                constants, uint32_t(raw.size()));
+            context.end_timestamp(preprocess, 0);
+            const VkMemoryBarrier preprocess_to_host{
+                VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                nullptr,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_HOST_READ_BIT,
+            };
+            vkCmdPipelineBarrier(
+                preprocess, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, &preprocess_to_host,
+                0, nullptr, 0, nullptr);
+            context.submit_and_wait(preprocess);
+            gpu_milliseconds += context.timestamp_milliseconds(0);
+            context.invalidate(count_buffer);
+
+            const uint32_t * counts =
+                static_cast<const uint32_t *>(count_buffer.mapped);
+            chunk_pairs_64 = 0;
+            for (size_t index = 0; index < raw.size(); ++index) {
+                chunk_pairs_64 += counts[index];
+            }
+            if (chunk_pairs_64 <=
+                std::numeric_limits<uint32_t>::max()) {
+                offsets[0] = 0;
+                uint64_t running = 0;
+                for (size_t index = 0; index < raw.size(); ++index) {
+                    running += counts[index];
+                    offsets[index + 1] = uint32_t(running);
+                }
+                break;
+            }
+            if (chunk_z_count == 1) {
+                throw std::overflow_error(
+                    "one voxel Z plane exceeds uint32 Gaussian "
+                    "candidate indexing");
+            }
+            chunk_z_count = std::max(1u, chunk_z_count / 2);
         }
-        offsets[index + 1] = uint32_t(total_pairs_64);
-    }
-    constants.total_pairs = uint32_t(total_pairs_64);
 
-    vk_buffer offset_staging = context.create_buffer(
-        offsets.size() * sizeof(uint32_t), transfer_source,
-        host_memory, coherent);
-    std::memcpy(offset_staging.mapped, offsets.data(),
-                offsets.size() * sizeof(uint32_t));
-    context.flush(offset_staging);
-    vk_buffer offset_buffer = context.create_buffer(
-        offsets.size() * sizeof(uint32_t),
-        storage | transfer_destination, device_memory);
-    context.copy_buffer(offset_staging, offset_buffer,
-                        offsets.size() * sizeof(uint32_t));
+        constants.total_pairs = uint32_t(chunk_pairs_64);
+        const uint32_t chunk_voxel_count = uint32_t(
+            plane_voxels * chunk_z_count);
+        largest_chunk_voxels =
+            std::max(largest_chunk_voxels, chunk_voxel_count);
 
-    const uint64_t voxel_count_64 =
-        uint64_t(options.resolution) *
-        options.resolution * options.resolution;
-    if (voxel_count_64 > std::numeric_limits<uint32_t>::max()) {
-        throw std::overflow_error(
-            "voxel grid exceeds uint32 linear indexing");
-    }
-    const uint32_t voxel_count = uint32_t(voxel_count_64);
-    vk_buffer accumulation_buffer = context.create_buffer(
-        uint64_t(voxel_count) * 5 * sizeof(uint32_t),
-        storage | transfer_destination, device_memory);
-    vk_buffer record_buffer = context.create_buffer(
-        uint64_t(voxel_count) * sizeof(voxel_record_gpu),
-        storage | transfer_source, device_memory);
-    vk_buffer counter_buffer = context.create_buffer(
-        sizeof(uint32_t), storage | transfer_destination,
-        host_memory, coherent);
-    context.update_binding(2, offset_buffer);
-    context.update_binding(3, accumulation_buffer);
-    context.update_binding(4, record_buffer);
-    context.update_binding(5, counter_buffer);
+        std::memcpy(offset_staging.mapped, offsets.data(),
+                    offsets.size() * sizeof(uint32_t));
+        context.flush(offset_staging);
+        context.update_binding(2, offset_buffer);
 
-    VkCommandBuffer integrate = context.begin_commands();
-    vkCmdFillBuffer(integrate, accumulation_buffer.buffer,
-                    0, VK_WHOLE_SIZE, 0);
-    vkCmdFillBuffer(integrate, counter_buffer.buffer,
-                    0, sizeof(uint32_t), 0);
-    const VkMemoryBarrier transfer_to_compute{
-        VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        nullptr,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-    };
-    vkCmdPipelineBarrier(
-        integrate, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &transfer_to_compute,
-        0, nullptr, 0, nullptr);
-    context.begin_timestamp(integrate, 2);
-    bind_compute(integrate, context,
-                 context.integrate_pipeline(), constants);
-    if (constants.total_pairs > 0) {
-        vkCmdDispatch(
-            integrate,
-            dispatch_groups(constants.total_pairs, context), 1, 1);
-    }
-    shader_barrier(integrate);
-    bind_compute(integrate, context,
-                 context.finalize_pipeline(), constants);
-    vkCmdDispatch(integrate,
-                  dispatch_groups(voxel_count, context), 1, 1);
-    context.end_timestamp(integrate, 2);
-    const VkMemoryBarrier compute_to_host{
-        VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        nullptr,
-        VK_ACCESS_SHADER_WRITE_BIT,
-        VK_ACCESS_HOST_READ_BIT,
-    };
-    vkCmdPipelineBarrier(
-        integrate, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_HOST_BIT,
-        0, 1, &compute_to_host,
-        0, nullptr, 0, nullptr);
-    context.submit_and_wait(integrate);
-    context.invalidate(counter_buffer);
-    const uint32_t occupied =
-        *static_cast<const uint32_t *>(counter_buffer.mapped);
-    if (occupied > voxel_count) {
-        throw std::runtime_error(
-            "Vulkan voxel counter exceeded grid size");
-    }
+        VkCommandBuffer integrate = context.begin_commands();
+        const VkBufferCopy offset_copy{
+            0, 0, offsets.size() * sizeof(uint32_t)};
+        vkCmdCopyBuffer(
+            integrate, offset_staging.buffer, offset_buffer.buffer,
+            1, &offset_copy);
+        vkCmdFillBuffer(
+            integrate, accumulation_buffer.buffer, 0,
+            uint64_t(chunk_voxel_count) * 5 * sizeof(uint32_t), 0);
+        vkCmdFillBuffer(
+            integrate, counter_buffer.buffer,
+            0, sizeof(uint32_t), 0);
+        const VkMemoryBarrier transfer_to_compute{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        vkCmdPipelineBarrier(
+            integrate, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &transfer_to_compute,
+            0, nullptr, 0, nullptr);
+        context.begin_timestamp(integrate, 2);
+        dispatch_compute(
+            integrate, context, context.integrate_pipeline(),
+            constants, constants.total_pairs);
+        shader_barrier(integrate);
+        dispatch_compute(
+            integrate, context, context.finalize_pipeline(),
+            constants, chunk_voxel_count);
+        context.end_timestamp(integrate, 2);
+        const VkMemoryBarrier compute_to_host_and_transfer{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            nullptr,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        vkCmdPipelineBarrier(
+            integrate, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &compute_to_host_and_transfer,
+            0, nullptr, 0, nullptr);
+        context.submit_and_wait(integrate);
+        gpu_milliseconds += context.timestamp_milliseconds(2);
+        context.invalidate(counter_buffer);
 
-    vk_buffer readback_buffer = context.create_buffer(
-        uint64_t(std::max(occupied, 1u)) *
-            sizeof(voxel_record_gpu),
-        transfer_destination, host_memory, coherent);
-    if (occupied > 0) {
-        context.copy_buffer(
-            record_buffer, readback_buffer,
-            uint64_t(occupied) * sizeof(voxel_record_gpu));
-        context.invalidate(readback_buffer);
+        const uint32_t occupied =
+            *static_cast<const uint32_t *>(counter_buffer.mapped);
+        if (occupied > chunk_voxel_count) {
+            throw std::runtime_error(
+                "Vulkan voxel counter exceeded chunk size");
+        }
+
+        vk_buffer readback_buffer = context.create_buffer(
+            uint64_t(std::max(occupied, 1u)) *
+                sizeof(voxel_record_gpu),
+            transfer_destination, host_memory, coherent);
+        if (occupied > 0) {
+            context.copy_buffer(
+                record_buffer, readback_buffer,
+                uint64_t(occupied) * sizeof(voxel_record_gpu));
+            context.invalidate(readback_buffer);
+        }
+        std::vector<voxel_record_gpu> records(occupied);
+        if (occupied > 0) {
+            std::memcpy(
+                records.data(), readback_buffer.mapped,
+                records.size() * sizeof(voxel_record_gpu));
+        }
+        append_voxel_payload(records, voxel_count, payload);
+
+        total_pairs_64 += chunk_pairs_64;
+        occupied_total += occupied;
+        ++chunk_count;
+        chunk_z_begin += chunk_z_count;
     }
-    std::vector<voxel_record_gpu> records(occupied);
-    if (occupied > 0) {
-        std::memcpy(records.data(), readback_buffer.mapped,
-                    records.size() * sizeof(voxel_record_gpu));
-    }
-    const voxel_payload_v2 payload =
-        materialize_voxel_payload(records, voxel_count);
     const auto conversion_end = std::chrono::steady_clock::now();
     write_voxel_file(
         options, origin, voxel_size,
@@ -1289,20 +1421,21 @@ voxel_conversion_result convert_gaussian_ply_to_voxels(
     result.device_name = context.device_name();
     result.gaussian_count = gaussians.size();
     result.aabb_candidate_pairs = total_pairs_64;
-    result.occupied_voxels = occupied;
+    result.occupied_voxels = occupied_total;
     result.output_bytes =
         sizeof(voxel_file_header_v2) +
         payload.occupancy.size() + payload.colors.size();
     result.converter_gpu_bytes = context.peak_bytes();
+    result.converter_device_bytes = context.peak_device_bytes();
+    result.chunk_count = chunk_count;
+    result.max_chunk_voxels = largest_chunk_voxels;
     result.setup_milliseconds =
         std::chrono::duration<double, std::milli>(
             setup_end - setup_begin).count();
     result.conversion_milliseconds =
         std::chrono::duration<double, std::milli>(
             conversion_end - conversion_begin).count();
-    result.gpu_milliseconds =
-        context.timestamp_milliseconds(0) +
-        context.timestamp_milliseconds(2);
+    result.gpu_milliseconds = gpu_milliseconds;
     return result;
 }
 
