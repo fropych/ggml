@@ -210,6 +210,42 @@ Run from PowerShell or `cmd.exe`:
 The downloader invokes the `curl.exe` bundled with current Windows versions.
 For older Windows installations, place a compatible `curl.exe` on `PATH`.
 
+## Publishing a GitHub release
+
+TripoSplat release builds run only when a tag matching
+`triposplat-vMAJOR.MINOR.PATCH` is pushed. Ordinary commits and pull requests
+do not trigger an automated build; the repository's general ggml CI is
+available only as a manual workflow. To publish a version from the commit
+currently checked out:
+
+```sh
+git status --short
+git push origin HEAD
+release_tag=triposplat-v0.1.0
+git tag -a "${release_tag}" -m "TripoSplat v0.1.0"
+git push origin "${release_tag}"
+```
+
+Use a new semantic version in place of `0.1.0`. The tag push starts the
+`TripoSplat Release` workflow. It creates a draft release, builds only the
+Vulkan TripoSplat CLI, and uploads these files directly to the release:
+
+```text
+triposplat-linux-x86_64.tar.gz
+triposplat-windows-x86_64.zip
+```
+
+No temporary GitHub Actions artifacts are used. The Windows archive is
+cross-compiled with MinGW-w64 on an Ubuntu runner. Both builds use the pinned
+LunarG Vulkan SDK 1.4.350.1 archive after verifying its SHA-256 checksum. The
+release remains a draft unless both archives build, pass their package smoke
+checks, and upload successfully; the final job then publishes it.
+
+Follow the run on the repository's **Actions** page and download published
+versions from **Releases**. A failed transient job can be re-run in Actions.
+If code must change, commit the fix and publish a new patch tag instead of
+moving a published tag.
+
 ## Native C++ end-to-end CLI
 
 `triposplat-vulkan generate` runs image decoding/preprocessing, DINO, stochastic
