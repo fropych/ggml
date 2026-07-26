@@ -1,27 +1,190 @@
-name: Release
+name: TripoSplat Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'triposplat-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: triposplat-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
+  prepare-release:
+    name: Prepare draft release
+    runs-on: ubuntu-24.04
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; reusing it."
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "TripoSplat ${GITHUB_REF_NAME#triposplat-}"
+          fi
 
-    - name: Create Release
-      id: create_release
-      uses: ggml-org/action-create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-          tag_name: ${{ github.ref_name }}
-          release_name: ${{ github.ref }}
-          draft: false
-          prerelease: false
+  build-linux:
+    name: Build Linux x86-64
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    env:
+      VULKAN_SDK: ${{ runner.temp }}/vulkan-sdk/1.4.350.1/x86_64
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            cmake \
+            curl \
+            libvulkan1 \
+            libwebp-dev \
+            ninja-build \
+            nlohmann-json3-dev \
+            xz-utils
+
+      - name: Install Vulkan SDK 1.4.350.1
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/vulkansdk-linux-x86_64-1.4.350.1.tar.xz"
+          curl -fL --retry 3 \
+            -o "${archive}" \
+            "https://sdk.lunarg.com/sdk/download/1.4.350.1/linux/vulkan_sdk.tar.xz"
+          echo "6cce33c7e5383814150c5041820769d93c65a1fd883002e5949b067045a07daa  ${archive}" \
+            | sha256sum --check -
+          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
+          tar -xJf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
+          "${VULKAN_SDK}/bin/glslc" --version
+
+      - name: Configure TripoSplat
+        run: |
+          cmake -S . -B builds/release-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_CPU=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_BUILD_EXAMPLES=ON \
+            -DGGML_BUILD_TESTS=OFF \
+            -DGGML_BUILD_TOOLS=OFF
+
+      - name: Build portable archive
+        run: |
+          cmake --build builds/release-linux \
+            --target triposplat-package \
+            --parallel
+
+      - name: Validate Linux archive
+        run: |
+          set -euo pipefail
+          archive="builds/release-linux/triposplat-linux-x86_64.tar.gz"
+          test -s "${archive}"
+          tar -tzf "${archive}"
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          bundle="${RUNNER_TEMP}/triposplat-linux-x86_64"
+          test -x "${bundle}/triposplat-vulkan"
+          test -f "${bundle}/libggml-vulkan.so.0"
+          test -f "${bundle}/libggml-base.so.0"
+          test -f "${bundle}/assets/flow_positions.safetensors"
+          "${bundle}/triposplat-vulkan" >"${RUNNER_TEMP}/triposplat-help.txt" 2>&1 \
+            && exit 1 || test "$?" -eq 2
+          grep -q "Usage:" "${RUNNER_TEMP}/triposplat-help.txt"
+
+      - name: Upload Linux archive to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            builds/release-linux/triposplat-linux-x86_64.tar.gz \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  build-windows:
+    name: Build Windows x86-64
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    env:
+      VULKAN_SDK: ${{ runner.temp }}/vulkan-sdk/1.4.350.1/x86_64
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+
+      - name: Install cross-build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            cmake \
+            curl \
+            mingw-w64 \
+            ninja-build \
+            nlohmann-json3-dev \
+            unzip \
+            xz-utils
+
+      - name: Install Vulkan SDK 1.4.350.1
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/vulkansdk-linux-x86_64-1.4.350.1.tar.xz"
+          curl -fL --retry 3 \
+            -o "${archive}" \
+            "https://sdk.lunarg.com/sdk/download/1.4.350.1/linux/vulkan_sdk.tar.xz"
+          echo "6cce33c7e5383814150c5041820769d93c65a1fd883002e5949b067045a07daa  ${archive}" \
+            | sha256sum --check -
+          mkdir -p "${RUNNER_TEMP}/vulkan-sdk"
+          tar -xJf "${archive}" -C "${RUNNER_TEMP}/vulkan-sdk"
+          "${VULKAN_SDK}/bin/glslc" --version
+
+      - name: Build portable Windows archive
+        run: ./examples/triposplat/build-windows-cross.sh
+
+      - name: Validate Windows archive
+        run: |
+          set -euo pipefail
+          archive="builds/windows-x86_64/triposplat-windows-x86_64.zip"
+          test -s "${archive}"
+          unzip -t "${archive}"
+          unzip -q "${archive}" -d "${RUNNER_TEMP}"
+          bundle="${RUNNER_TEMP}/triposplat-windows-x86_64"
+          test -f "${bundle}/triposplat-vulkan.exe"
+          test -f "${bundle}/assets/flow_positions.safetensors"
+          x86_64-w64-mingw32-objdump -p \
+            "${bundle}/triposplat-vulkan.exe" \
+            | grep "DLL Name"
+
+      - name: Upload Windows archive to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            builds/windows-x86_64/triposplat-windows-x86_64.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
+
+  publish-release:
+    name: Publish release
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish completed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest
