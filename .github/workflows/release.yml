@@ -98,11 +98,34 @@ jobs:
           bundle="${RUNNER_TEMP}/triposplat-linux-x86_64"
           test -x "${bundle}/triposplat-vulkan"
           test -f "${bundle}/libggml-vulkan.so.0"
+          test -f "${bundle}/libggml.so.0"
           test -f "${bundle}/libggml-base.so.0"
           test -f "${bundle}/assets/flow_positions.safetensors"
+          test -f "${bundle}/licenses/CivetWeb-LICENSE.md"
           "${bundle}/triposplat-vulkan" >"${RUNNER_TEMP}/triposplat-help.txt" 2>&1 \
             && exit 1 || test "$?" -eq 2
           grep -q "Usage:" "${RUNNER_TEMP}/triposplat-help.txt"
+          if grep -q -- "--assets" \
+              "${RUNNER_TEMP}/triposplat-help.txt"; then
+            echo "public CLI unexpectedly exposes --assets" >&2
+            exit 1
+          fi
+          if "${bundle}/triposplat-vulkan" generate ignored \
+              --model-dir ignored --assets ignored \
+              >"${RUNNER_TEMP}/triposplat-assets-reject.txt" 2>&1; then
+            echo "removed --assets option was unexpectedly accepted" >&2
+            exit 1
+          fi
+          grep -q "unknown generate option: --assets" \
+            "${RUNNER_TEMP}/triposplat-assets-reject.txt"
+          "${bundle}/triposplat-vulkan" serve --help \
+            >"${RUNNER_TEMP}/triposplat-serve-help.txt" 2>&1
+          grep -q -- "--port" "${RUNNER_TEMP}/triposplat-serve-help.txt"
+          if grep -q -- "--assets" \
+              "${RUNNER_TEMP}/triposplat-serve-help.txt"; then
+            echo "serve unexpectedly exposes --assets" >&2
+            exit 1
+          fi
 
       - name: Upload Linux archive to release
         env:
@@ -161,9 +184,17 @@ jobs:
           bundle="${RUNNER_TEMP}/triposplat-windows-x86_64"
           test -f "${bundle}/triposplat-vulkan.exe"
           test -f "${bundle}/assets/flow_positions.safetensors"
+          test -f "${bundle}/licenses/CivetWeb-LICENSE.md"
           x86_64-w64-mingw32-objdump -p \
             "${bundle}/triposplat-vulkan.exe" \
-            | grep "DLL Name"
+            | tee "${RUNNER_TEMP}/triposplat-windows-imports.txt"
+          grep -qi "DLL Name: WS2_32.dll" \
+            "${RUNNER_TEMP}/triposplat-windows-imports.txt"
+          if grep -qi "DLL Name: libwinpthread" \
+              "${RUNNER_TEMP}/triposplat-windows-imports.txt"; then
+            echo "winpthreads must be linked statically" >&2
+            exit 1
+          fi
 
       - name: Upload Windows archive to release
         env:

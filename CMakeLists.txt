@@ -277,6 +277,8 @@ option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation" 
 
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
+option(TRIPOSPLAT_BUILD_TESTS
+       "Build TripoSplat C++ contract tests"       ${GGML_BUILD_TESTS})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
 
 #
@@ -305,8 +307,11 @@ add_subdirectory(src)
 # tests and examples
 #
 
-if (GGML_BUILD_TESTS)
+if (GGML_BUILD_TESTS OR TRIPOSPLAT_BUILD_TESTS)
     enable_testing()
+endif ()
+
+if (GGML_BUILD_TESTS)
     add_subdirectory(tests)
 endif ()
 
