@@ -13,6 +13,7 @@
 #include "e2e-worker.h"
 #include "pipeline.h"
 #include "model-store.h"
+#include "server.h"
 #include "voxel-converter.h"
 
 #include <cstdio>
@@ -38,7 +39,8 @@ static void usage(const char * argv0) {
         "Usage:\n"
         "  %s generate IMAGE --model-dir DIR [--output PREFIX] [OPTIONS]\n"
         "  %s voxelize INPUT.ply --output OUTPUT.tsvox [OPTIONS]\n"
-        "  %s download --model-dir DIR [--repo REPO] [--revision REV]\n\n"
+        "  %s download --model-dir DIR [--repo REPO] [--revision REV]\n"
+        "  %s serve --model-dir DIR [OPTIONS]\n\n"
         "Generate options:\n"
         "  --steps N              Flow steps (default: 20)\n"
         "  --guidance F           Classifier-free guidance (default: 3.0)\n"
@@ -46,7 +48,6 @@ static void usage(const char * argv0) {
         "  --seed N               Random seed (default: 42)\n"
         "  --erode-radius N       Alpha erosion radius (default: 1)\n"
         "  --device N             Vulkan device index (default: 0)\n"
-        "  --assets DIR           Runtime asset directory\n"
         "  --download             Download missing weights from Hugging Face\n"
         "  --keep-temp            Preserve intermediate safetensors\n\n"
         "Voxelize options:\n"
@@ -76,7 +77,7 @@ static void usage(const char * argv0) {
         "  %s --run-decode MODEL.safetensors INPUT.safetensors OUTPUT_PREFIX [GAUSSIANS] [SEED]\n\n"
         "The executable initializes Vulkan directly; it never creates a CPU backend.\n",
         argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0,
-        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static std::string option_value(int & index, int argc, char ** argv) {
@@ -148,6 +149,10 @@ static std::filesystem::path executable_directory(const char * argv0) {
 
 static int run_cli_command(int argc, char ** argv) {
     const std::string command = argv[1];
+    if (command == "serve") {
+        return run_server_command(
+            argc, argv, executable_directory(argv[0]));
+    }
     if (command == "download") {
         model_store_config config;
         for (int i = 2; i < argc; ++i) {
@@ -243,7 +248,6 @@ static int run_cli_command(int argc, char ** argv) {
         else if (option == "--repo") options.models.repository = option_value(i, argc, argv);
         else if (option == "--revision") options.models.revision = option_value(i, argc, argv);
         else if (option == "--output") options.output_prefix = option_value(i, argc, argv);
-        else if (option == "--assets") options.asset_directory = option_value(i, argc, argv);
         else if (option == "--steps") options.steps = std::stoi(option_value(i, argc, argv));
         else if (option == "--guidance") options.guidance = std::stof(option_value(i, argc, argv));
         else if (option == "--num-gaussians") options.num_gaussians =
@@ -258,9 +262,8 @@ static int run_cli_command(int argc, char ** argv) {
         else throw std::invalid_argument("unknown generate option: " + option);
     }
     if (options.models.directory.empty()) throw std::invalid_argument("--model-dir is required");
-    if (options.asset_directory.empty()) {
-        options.asset_directory = (executable_directory(argv[0]) / "assets").string();
-    }
+    options.asset_directory =
+        (executable_directory(argv[0]) / "assets").string();
     pipeline runtime(device);
     std::printf("Vulkan device: %s\n", runtime.device_description().c_str());
     const generate_result result = runtime.generate(options);

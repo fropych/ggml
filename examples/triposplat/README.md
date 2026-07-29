@@ -62,19 +62,23 @@ Its layout is:
 triposplat-linux-x86_64/
 ├── triposplat-vulkan
 ├── libggml-vulkan.so.0
+├── libggml.so.0
 ├── libggml-base.so.0
 ├── assets/flow_positions.safetensors
+├── licenses/CivetWeb-LICENSE.md
 ├── README.md
 ├── VOXEL_FORMAT.md
+├── VOXEL_CHUNKING_BENCHMARK.md
+├── VOXEL_SURFACE_BENCHMARK.md
 └── LICENSE
 ```
 
 The executable has `RUNPATH=$ORIGIN`, so it finds the bundled ggml libraries
 next to itself without `LD_LIBRARY_PATH`. WebP and SharpYUV are linked
 statically. The target machine still supplies the normal Linux runtime,
-`libgomp.so.1`, `libvulkan.so.1`, and an NVIDIA Vulkan driver. The package is
-intended for another x86-64 machine running the same Linux distribution (or a
-distribution with a compatible glibc/libstdc++).
+`libstdc++.so.6`, `libgcc_s.so.1`, `libvulkan.so.1`, and a Vulkan driver. The
+package is intended for another x86-64 machine running the same Linux
+distribution (or a distribution with a compatible glibc/libstdc++).
 
 ```sh
 tar -xzf triposplat-linux-x86_64.tar.gz
@@ -83,8 +87,151 @@ cd triposplat-linux-x86_64
   --model-dir ./ckpts --output output
 ```
 
-The CLI resolves `assets/` relative to its own executable path, so it may be
-started from any working directory.
+The executable resolves `assets/` relative to its own path, so both CLI
+commands and the server may be started from any working directory.
+
+## REST API server
+
+The same executable can run a long-lived HTTP server. CivetWeb is linked
+statically, so this does not add a server executable, runtime package, or
+shared-library dependency:
+
+```sh
+./triposplat-vulkan serve \
+  --model-dir ./ckpts \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --artifact-dir ./artifacts \
+  --artifact-ttl 24h \
+  --max-artifacts 100 \
+  --max-artifact-bytes 50GiB
+```
+
+`--host` defaults to `127.0.0.1` and `--port` defaults to `8080`.
+`--cleanup-interval` controls the artifact cleanup pass and defaults to `60s`;
+`--device` selects the Vulkan device. Durations use `s`, `m`, `h`, or `d`,
+and byte limits use `B`, `KiB`, `MiB`, or `GiB`. Runtime assets are always
+loaded from `assets/` beside the executable and are not configurable through
+the command line. Model downloads remain an explicit CLI operation.
+
+The server validates the model directory, runtime asset, artifact store, and
+Vulkan device before it begins listening. It owns one GPU worker, so generation
+and voxelization jobs execute serially while HTTP upload, download, metadata,
+and status requests remain concurrent. A queued job can be cancelled; a
+running GPU job cannot be interrupted safely.
+
+The v1 routes are:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /health` | Readiness and API version |
+| `GET /v1/devices` | Vulkan devices and the server-selected device |
+| `POST /v1/artifacts` | Multipart upload with `type` and `file` fields |
+| `GET /v1/artifacts/{id}` | Artifact metadata |
+| `GET /v1/artifacts/{id}/content` | Artifact bytes |
+| `DELETE /v1/artifacts/{id}` | Delete an artifact that is not in use |
+| `POST /v1/generations` | Queue image-to-Gaussian generation |
+| `POST /v1/voxelizations` | Queue Gaussian-to-TSVOX conversion |
+| `GET /v1/jobs/{id}` | Job status, metrics, and output artifact IDs |
+| `DELETE /v1/jobs/{id}` | Cancel a queued job |
+
+Only `input_image` and `gaussian_ply` are accepted upload types. Generated
+outputs have `gaussian_ply` and `splat` types; voxel outputs have `tsvox`
+type. IDs are opaque and must not be interpreted as paths. There is no
+filesystem-path import endpoint.
+
+Upload an image, then queue generation:
+
+```sh
+curl -F type=input_image -F file=@input.webp \
+  http://127.0.0.1:8080/v1/artifacts
+
+curl -H 'Content-Type: application/json' \
+  -d '{
+    "input_artifact_id": "art_IMAGE_ID",
+    "seed": 42,
+    "steps": 20,
+    "guidance": 3.0,
+    "num_gaussians": 32768,
+    "erode_radius": 1
+  }' \
+  http://127.0.0.1:8080/v1/generations
+```
+
+Poll the returned `status_url`. A successful generation response contains
+`artifacts.gaussian_ply` and `artifacts.splat`. The Gaussian artifact can be
+voxelized directly, without downloading and uploading the PLY again:
+
+```sh
+curl -H 'Content-Type: application/json' \
+  -d '{
+    "input_artifact_id": "art_GENERATED_PLY_ID",
+    "resolution": 64
+  }' \
+  http://127.0.0.1:8080/v1/voxelizations
+```
+
+Generation accepts `seed`, `steps`, `guidance`, `num_gaussians`, and
+`erode_radius`, with the same defaults as the CLI. Voxelization accepts
+`resolution`, `opacity_threshold`, `color_weight_power`, `iso`, `tolerance`,
+`integration_steps`, and `chunk_depth`, also with CLI defaults. The model,
+runtime asset, and Vulkan device are server settings rather than per-request
+parameters. Unknown JSON fields and invalid numeric values are rejected.
+
+Each committed artifact is stored in its own `art_<opaque-id>/` directory with
+`manifest.json` and one data file. Uploads and job outputs first go to `.tmp`
+and become visible through an atomic directory rename. On startup, stale
+temporary entries are removed and committed manifests are reloaded.
+
+TTL is fixed from artifact creation rather than extended on access. Cleanup
+removes expired artifacts, then evicts the oldest artifacts until both
+`--max-artifacts` and `--max-artifact-bytes` are satisfied. An artifact leased
+by an active download or queued/running job is never evicted; a new commit
+fails cleanly if every possible eviction target is in use. Artifact files and
+manifests survive a server restart, but job status records are process-local.
+Because the input is leased until a job finishes, generation needs quota for
+the input plus its PLY and SPLAT outputs (at least three artifacts), while
+voxelization needs quota for its input and TSVOX output.
+
+The server has no authentication or TLS. Keep the default loopback host for
+local use; put it behind an authenticated TLS reverse proxy before exposing it
+to another network.
+
+### C++ API contract tests
+
+The artifact-store contract is dependency-free C++. The GPU HTTP contract
+uses the current `triposplat-vulkan` CLI as its reference: it runs the full
+generation pipeline with a fixed seed, compares API PLY and SPLAT files
+byte-for-byte, feeds the generated PLY artifact directly into the API, and
+compares 32³ and 64³ TSVOX files byte-for-byte. It does not invoke Python.
+
+```sh
+cmake -S . -B builds/vulkan-api -G Ninja \
+  -DGGML_VULKAN=ON \
+  -DGGML_CPU=OFF \
+  -DGGML_BUILD_EXAMPLES=ON \
+  -DGGML_BUILD_TESTS=OFF \
+  -DTRIPOSPLAT_BUILD_TESTS=ON
+cmake --build builds/vulkan-api \
+  --target triposplat-test-artifact-store triposplat-test-http-api -j
+
+ctest --test-dir builds/vulkan-api \
+  -R triposplat-artifact-store --output-on-failure
+
+./builds/vulkan-api/bin/triposplat-test-http-api \
+  --binary ./builds/vulkan-api/bin/triposplat-vulkan \
+  --input ../TripoSplat/static/example_inputs/building_stone_house.webp \
+  --model-dir ../TripoSplat/ckpts \
+  --device 0
+```
+
+The HTTP contract preserves its temporary output directory when it fails, so
+the CLI reference and downloaded API files remain available for inspection.
+To register it with CTest, set `TRIPOSPLAT_HTTP_CONTRACT_INPUT` and
+`TRIPOSPLAT_HTTP_CONTRACT_MODEL_DIR` at configure time; the optional
+`TRIPOSPLAT_HTTP_CONTRACT_DEVICE` selects the device. CTest then exposes it as
+`triposplat-http-api`, labels it `contract;gpu`, serializes it with a GPU
+resource lock, and applies a 30-minute timeout.
 
 ## Gaussian PLY to sparse voxels
 
@@ -191,13 +338,13 @@ SharpYUV statically, creates the Vulkan loader import library, and writes:
 builds/windows-x86_64/triposplat-windows-x86_64.zip
 ```
 
-The archive contains the console executable, runtime asset, README, and
-license. ggml, the Vulkan backend, WebP, SharpYUV, libstdc++, and libgcc are
-linked statically; OpenMP and the CPU backend are disabled. The executable
-therefore imports only `KERNEL32.dll`, `msvcrt.dll`, and `vulkan-1.dll`.
-The first two are Windows system libraries. `vulkan-1.dll` is supplied by the
-installed NVIDIA/AMD/Intel graphics driver; do not copy a Linux Vulkan library
-into the package.
+The archive contains the console executable, runtime asset, documentation, and
+licenses. ggml, the Vulkan backend, WebP, SharpYUV, CivetWeb, libstdc++, and
+libgcc are linked statically; OpenMP and the CPU backend are disabled. The
+HTTP server adds only the standard Windows `WS2_32.dll` socket import; no DLL
+is bundled for it. `KERNEL32.dll`, `msvcrt.dll`, and `WS2_32.dll` are Windows
+system libraries. `vulkan-1.dll` is supplied by the installed NVIDIA/AMD/Intel
+graphics driver; do not copy a Linux Vulkan library into the package.
 
 Run from PowerShell or `cmd.exe`:
 
@@ -205,6 +352,7 @@ Run from PowerShell or `cmd.exe`:
 .\triposplat-vulkan.exe download --model-dir .\ckpts
 .\triposplat-vulkan.exe generate .\input.webp `
   --model-dir .\ckpts --output .\output
+.\triposplat-vulkan.exe serve --model-dir .\ckpts --port 8080
 ```
 
 The downloader invokes the `curl.exe` bundled with current Windows versions.
@@ -228,7 +376,8 @@ git push origin "${release_tag}"
 
 Use a new semantic version in place of `0.1.0`. The tag push starts the
 `TripoSplat Release` workflow. It creates a draft release, builds only the
-Vulkan TripoSplat CLI, and uploads these files directly to the release:
+combined Vulkan TripoSplat CLI/server executable, and uploads these files
+directly to the release:
 
 ```text
 triposplat-linux-x86_64.tar.gz
@@ -277,10 +426,11 @@ Hugging Face using the system `curl` executable:
 Downloads use resumable `.part` files and are renamed only after a successful
 transfer. `--revision` pins a Hugging Face branch, tag, or commit.
 
-The implementation is split into the reusable `triposplat-core` library and a
-thin CLI. `pipeline.h` is the C++ API and `triposplat-c.h` is the stable C ABI
-intended for a future JNI/Windows DLL wrapper. A pipeline owns one Vulkan
-backend and can serve multiple `generate()` calls.
+The implementation is split into the reusable `triposplat-core` library,
+artifact/job/server modules, and one executable. `pipeline.h` is the C++ API
+and `triposplat-c.h` is the stable C ABI intended for a future JNI/Windows DLL
+wrapper. A pipeline owns one Vulkan backend and can serve multiple
+`generate()` calls.
 
 The current core invokes each verified model stage in-process and exchanges
 stage results through temporary safetensors. The public API does not expose
